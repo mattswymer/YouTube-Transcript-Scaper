@@ -486,7 +486,7 @@ class FlaskRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.headers["Location"].endswith("/batch-progress"))
-        start_worker.assert_called_once_with(browser="firefox")
+        start_worker.assert_called_once_with(browser="")
         self.assertEqual(app.load_batch_state()["videos"][1]["status"], "pending")
 
     def test_download_last_batch_exports_saved_text_without_requests(self):
