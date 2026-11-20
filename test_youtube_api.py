@@ -89,7 +89,7 @@ class CaptionDownloadTests(unittest.TestCase):
             def next_chunk(self):
                 if not self.finished:
                     self.output.write(
-                        b"WEBVTT\\n\\n00:00:00.000 --> 00:00:02.000\\nA caption.\\n"
+                        b"WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nA caption.\n"
                     )
                     self.finished = True
                 return None, True
