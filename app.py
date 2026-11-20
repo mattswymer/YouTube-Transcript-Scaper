@@ -542,7 +542,9 @@ PROGRESS_TEMPLATE = """
         <div class="notice" id="blockNotice" hidden></div>
 
         <div class="actions">
-            <a class="button" id="downloadButton" href="/download-last" hidden>Download combined transcripts</a>
+            <form id="downloadForm" method="POST" action="/download-last" hidden>
+                <button class="button" id="downloadButton" type="submit">Download combined transcripts</button>
+            </form>
             <form id="resumeForm" method="POST" action="/resume-last" hidden>
                 <button type="submit">Resume remaining videos</button>
             </form>
