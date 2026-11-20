@@ -6,7 +6,7 @@ where py >nul 2>&1
 if errorlevel 1 (
     where python >nul 2>&1
     if errorlevel 1 (
-        echo Python 3.10 or newer was not found.
+        echo Python 3.11 or newer was not found.
         echo Install Python from https://www.python.org/downloads/
         echo During setup, enable "Add Python to PATH".
         pause
@@ -15,6 +15,22 @@ if errorlevel 1 (
     set "PYTHON=python"
 ) else (
     set "PYTHON=py -3"
+)
+
+%PYTHON% -c "import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)"
+if errorlevel 1 (
+    echo Python 3.11 or newer is required.
+    echo Install a current version from https://www.python.org/downloads/
+    pause
+    exit /b 1
+)
+
+if exist ".venv\Scripts\python.exe" (
+    ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)"
+    if errorlevel 1 (
+        echo Removing the old Python environment because it is older than 3.11...
+        rmdir /s /q ".venv"
+    )
 )
 
 if not exist ".venv\Scripts\python.exe" (
