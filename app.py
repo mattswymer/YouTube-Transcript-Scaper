@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, Response, render_template_string, request, redirect, url_for
+from flask import Flask, Response, jsonify, render_template_string, request, redirect, url_for
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
@@ -24,6 +24,7 @@ REQUEST_DELAY_SECONDS = 2.5
 SUBTITLE_REQUEST_SLEEP_SECONDS = 2.0
 DATA_DIR = Path(__file__).resolve().parent / "data"
 BATCH_STATE_PATH = DATA_DIR / "last_batch.json"
+BATCH_WORKER_LOCK = threading.Lock()
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LANGUAGE_CODE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
@@ -404,6 +405,224 @@ HTML_TEMPLATE = """
 </html>
 """
 
+
+
+PROGRESS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#18181b">
+    <title>Transcript Download Progress</title>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 760px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #18181b;
+            color: #f4f4f5;
+        }
+        h1 { margin-bottom: 8px; font-size: 25px; }
+        h2 { margin: 0 0 8px; font-size: 17px; }
+        .subtitle, .muted { color: #a1a1aa; }
+        .panel {
+            margin-top: 22px;
+            padding: 20px;
+            border: 1px solid #3f3f46;
+            border-radius: 10px;
+            background: #202024;
+        }
+        .progress-heading {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: baseline;
+            margin-bottom: 9px;
+        }
+        .progress-value { color: #c4b5fd; font-size: 13px; white-space: nowrap; }
+        .track {
+            width: 100%;
+            height: 15px;
+            overflow: hidden;
+            border-radius: 99px;
+            background: #3f3f46;
+        }
+        .fill {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: #8b5cf6;
+            transition: width .25s ease;
+        }
+        .fill.current.indeterminate {
+            width: 35%;
+            animation: slide 1.4s ease-in-out infinite alternate;
+        }
+        @keyframes slide {
+            from { transform: translateX(-15%); }
+            to { transform: translateX(205%); }
+        }
+        .status { margin-top: 9px; color: #d4d4d8; font-size: 14px; }
+        .detail { margin-top: 5px; color: #a1a1aa; font-size: 13px; overflow-wrap: anywhere; }
+        .summary {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 18px;
+            margin-top: 18px;
+            color: #a1a1aa;
+            font-size: 13px;
+        }
+        .summary strong { color: #f4f4f5; }
+        .notice {
+            margin-top: 16px;
+            padding: 12px 14px;
+            border-radius: 7px;
+            background: #422006;
+            color: #fde68a;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+        button, a.button {
+            display: inline-block;
+            border: 0;
+            border-radius: 8px;
+            padding: 11px 16px;
+            font-size: 14px;
+            font-weight: 600;
+            color: white;
+            background: #7c3aed;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        a.secondary, button.secondary { background: #3f3f46; color: #f4f4f5; }
+        @media (max-width: 520px) {
+            body { margin: 24px auto; padding: 0 14px; }
+            .panel { padding: 16px; }
+            .actions > * { flex: 1 1 100%; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Downloading transcripts</h1>
+    <p class="subtitle" id="playlistTitle">{{ playlist_title }}</p>
+
+    <section class="panel">
+        <div class="progress-heading">
+            <h2>Current video</h2>
+            <span class="progress-value" id="currentPosition">Preparing…</span>
+        </div>
+        <div class="track" role="progressbar" aria-label="Current video progress">
+            <div class="fill current indeterminate" id="currentBar"></div>
+        </div>
+        <div class="status" id="currentStatus">Starting transcript retrieval…</div>
+        <div class="detail" id="currentTitle"></div>
+
+        <div style="height:26px"></div>
+
+        <div class="progress-heading">
+            <h2>All selected videos</h2>
+            <span class="progress-value" id="overallPercent">0%</span>
+        </div>
+        <div class="track" role="progressbar" aria-label="Overall batch progress">
+            <div class="fill" id="overallBar"></div>
+        </div>
+        <div class="status" id="overallStatus">0 of 0 videos processed</div>
+
+        <div class="summary">
+            <span>Transcripts: <strong id="successCount">0</strong></span>
+            <span>No captions: <strong id="noCaptionCount">0</strong></span>
+            <span>Unavailable: <strong id="unavailableCount">0</strong></span>
+            <span>Errors: <strong id="failedCount">0</strong></span>
+        </div>
+
+        <div class="notice" id="blockNotice" hidden></div>
+
+        <div class="actions">
+            <a class="button" id="downloadButton" href="/download-last" hidden>Download combined transcripts</a>
+            <form id="resumeForm" method="POST" action="/resume-last" hidden>
+                <button type="submit">Resume remaining videos</button>
+            </form>
+            <a class="button secondary" href="/">Back to scraper</a>
+        </div>
+        <p class="muted" style="font-size:12px;margin-bottom:0">
+            This page updates automatically. You can leave it open while the batch runs.
+        </p>
+    </section>
+
+    <script>
+    (function () {
+        const currentBar = document.getElementById("currentBar");
+        const currentPosition = document.getElementById("currentPosition");
+        const currentStatus = document.getElementById("currentStatus");
+        const currentTitle = document.getElementById("currentTitle");
+        const overallBar = document.getElementById("overallBar");
+        const overallPercent = document.getElementById("overallPercent");
+        const overallStatus = document.getElementById("overallStatus");
+        const successCount = document.getElementById("successCount");
+        const noCaptionCount = document.getElementById("noCaptionCount");
+        const unavailableCount = document.getElementById("unavailableCount");
+        const failedCount = document.getElementById("failedCount");
+        const blockNotice = document.getElementById("blockNotice");
+        const downloadButton = document.getElementById("downloadButton");
+        const resumeForm = document.getElementById("resumeForm");
+
+        async function refreshProgress() {
+            try {
+                const response = await fetch("/api/batch-progress", {cache: "no-store"});
+                if (!response.ok) throw new Error("Progress request failed");
+                const data = await response.json();
+
+                const percent = Math.max(0, Math.min(100, data.percent || 0));
+                overallBar.style.width = percent + "%";
+                overallPercent.textContent = Math.round(percent) + "%";
+                overallStatus.textContent = data.processed + " of " + data.total + " videos processed";
+
+                currentPosition.textContent = data.current_index && data.total
+                    ? "Video " + data.current_index + " of " + data.total
+                    : (data.processing ? "Preparing…" : "Batch complete");
+                currentStatus.textContent = data.current_status || "Waiting";
+                currentTitle.textContent = data.current_title || "";
+
+                currentBar.classList.toggle("indeterminate", Boolean(data.processing));
+                if (!data.processing) {
+                    currentBar.style.width = (data.current_progress || 0) + "%";
+                } else {
+                    currentBar.style.width = "35%";
+                }
+
+                successCount.textContent = data.successful;
+                noCaptionCount.textContent = data.no_transcript;
+                unavailableCount.textContent = data.unavailable;
+                failedCount.textContent = data.failed;
+
+                blockNotice.hidden = !data.block_reason;
+                blockNotice.textContent = data.block_reason || "";
+
+                downloadButton.hidden = data.processing || data.total === 0;
+                resumeForm.hidden = data.processing || data.retryable === 0;
+
+                if (!data.processing && data.pending === 0) {
+                    currentStatus.textContent = data.failed
+                        ? "Finished, with some videos that can be retried."
+                        : "All selected videos have been processed.";
+                }
+                window.setTimeout(refreshProgress, data.processing ? 1000 : 5000);
+            } catch (error) {
+                currentStatus.textContent = "Connection interrupted. Checking again…";
+                window.setTimeout(refreshProgress, 2000);
+            }
+        }
+
+        refreshProgress();
+    })();
+    </script>
+</body>
+</html>
+"""
 
 def render_page(
     error=None,
@@ -1067,6 +1286,11 @@ def process_saved_batch(state, browser=None):
     browser = normalize_browser(browser if browser is not None else state.get("browser"))
     state["browser"] = browser
     state["block_reason"] = ""
+    state["is_processing"] = True
+    state.setdefault("current_video_index", 0)
+    state.setdefault("current_video_title", "")
+    state.setdefault("current_video_status", "Starting batch")
+    state.setdefault("current_video_progress", 0)
     save_batch_state(state)
 
     videos = state.get("videos") or []
@@ -1074,31 +1298,56 @@ def process_saved_batch(state, browser=None):
         if item.get("status") not in ("pending", "failed"):
             continue
 
+        state["current_video_index"] = index + 1
+        state["current_video_title"] = item.get("title") or item.get("video_id")
+        state["current_video_status"] = "Requesting captions from YouTube…"
+        state["current_video_progress"] = 15
+        item["status"] = "pending"
+        save_batch_state(state)
+
         try:
+            state["current_video_status"] = "Retrieving and formatting captions…"
+            state["current_video_progress"] = 45
+            save_batch_state(state)
+
             transcript = fetch_single_transcript(
                 item["video_id"],
                 bool(state.get("include_timestamps", True)),
                 state.get("languages") or ["en"],
                 browser=browser,
             )
+            state["current_video_status"] = "Saving transcript…"
+            state["current_video_progress"] = 90
+            save_batch_state(state)
+
             item["status"] = "complete"
             item["transcript"] = transcript
             item["error"] = ""
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "Transcript saved"
         except NoTranscriptAvailable as exc:
             item["status"] = "no_transcript"
             item["error"] = str(exc)
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "No captions available"
         except TranscriptUnavailable as exc:
             item["status"] = "unavailable"
             item["error"] = str(exc)
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "Video unavailable"
         except TranscriptBlocked as exc:
             item["status"] = "pending"
             item["error"] = str(exc)
             state["block_reason"] = str(exc)
+            state["current_video_status"] = "Paused — YouTube blocked the request"
+            state["is_processing"] = False
             save_batch_state(state)
             break
         except Exception as exc:
             item["status"] = "failed"
             item["error"] = describe_transcript_error(exc)
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "This video failed; continuing to the next"
 
         save_batch_state(state)
 
@@ -1106,11 +1355,113 @@ def process_saved_batch(state, browser=None):
             time.sleep(REQUEST_DELAY_SECONDS)
 
     state["updated_at"] = datetime.now().astimezone().isoformat()
+    state["is_processing"] = False
+    if not state.get("block_reason"):
+        state["current_video_status"] = "Batch finished"
+        state["current_video_progress"] = 100
     save_batch_state(state)
 
     filename = f"dnd_transcripts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
     return make_text_download(build_batch_export(state), filename)
-@app.route("/", methods=["GET", "POST"])
+
+
+def batch_progress_snapshot():
+    state = load_batch_state()
+    if not state:
+        return {
+            "exists": False,
+            "processing": False,
+            "total": 0,
+            "processed": 0,
+            "pending": 0,
+            "retryable": 0,
+            "percent": 0,
+            "successful": 0,
+            "no_transcript": 0,
+            "unavailable": 0,
+            "failed": 0,
+            "current_index": 0,
+            "current_title": "",
+            "current_status": "No batch loaded",
+            "current_progress": 0,
+            "block_reason": "",
+        }
+
+    videos = state.get("videos") or []
+    statuses = [item.get("status", "pending") for item in videos]
+    total = len(videos)
+    pending = statuses.count("pending")
+    successful = statuses.count("complete")
+    no_transcript = statuses.count("no_transcript")
+    unavailable = statuses.count("unavailable")
+    failed = statuses.count("failed")
+    processed = total - pending
+    percent = round(processed * 100 / total) if total else 0
+
+    return {
+        "exists": True,
+        "playlist_title": state.get("playlist_title", "YouTube Playlist"),
+        "processing": bool(state.get("is_processing")),
+        "total": total,
+        "processed": processed,
+        "pending": pending,
+        "retryable": pending + failed,
+        "percent": percent,
+        "successful": successful,
+        "no_transcript": no_transcript,
+        "unavailable": unavailable,
+        "failed": failed,
+        "current_index": state.get("current_video_index", 0),
+        "current_title": state.get("current_video_title", ""),
+        "current_status": state.get("current_video_status", ""),
+        "current_progress": state.get("current_video_progress", 0),
+        "block_reason": state.get("block_reason", ""),
+    }
+
+
+def _run_batch_worker(browser=None):
+    try:
+        state = load_batch_state()
+        if state:
+            process_saved_batch(state, browser=browser)
+    except Exception as exc:
+        state = load_batch_state()
+        if state:
+            state["is_processing"] = False
+            state["current_video_status"] = f"Batch stopped unexpectedly ({type(exc).__name__})"
+            state["block_reason"] = str(exc)
+            save_batch_state(state)
+    finally:
+        BATCH_WORKER_LOCK.release()
+
+
+def start_batch_worker(browser=None):
+    """Run the long playlist batch outside the request so the page can poll progress."""
+    if not BATCH_WORKER_LOCK.acquire(blocking=False):
+        return False
+
+    try:
+        state = load_batch_state()
+        if not state:
+            BATCH_WORKER_LOCK.release()
+            return False
+
+        state["is_processing"] = True
+        state["browser"] = normalize_browser(browser if browser is not None else state.get("browser"))
+        state["current_video_status"] = "Starting batch…"
+        save_batch_state(state)
+
+        worker = threading.Thread(
+            target=_run_batch_worker,
+            args=(state["browser"],),
+            daemon=True,
+            name="transcript-batch-worker",
+        )
+        worker.start()
+        return True
+    except Exception:
+        BATCH_WORKER_LOCK.release()
+        raise@app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
         return render_page()
@@ -1274,6 +1625,11 @@ def download_playlist():
         "browser": browser,
         "created_at": datetime.now().astimezone().isoformat(),
         "block_reason": "",
+        "is_processing": False,
+        "current_video_index": 0,
+        "current_video_title": "",
+        "current_video_status": "Queued",
+        "current_video_progress": 0,
         "videos": [
             {
                 **entry,
@@ -1285,7 +1641,9 @@ def download_playlist():
         ],
     }
     save_batch_state(state)
-    return process_saved_batch(state, browser=browser)
+    if not start_batch_worker(browser=browser):
+        return render_page("Another transcript batch is already running.", status=409)
+    return redirect(url_for("batch_progress_page"))
 
 
 @app.route("/resume-last", methods=["POST"])
@@ -1295,7 +1653,28 @@ def resume_last_batch():
         return render_page("There is no saved batch to resume.", status=400)
 
     browser = normalize_browser(request.form.get("browser", state.get("browser", "")))
-    return process_saved_batch(state, browser=browser)
+    state["browser"] = browser
+    save_batch_state(state)
+    if not start_batch_worker(browser=browser):
+        return render_page("Another transcript batch is already running.", status=409)
+    return redirect(url_for("batch_progress_page"))
+
+
+@app.route("/batch-progress")
+def batch_progress_page():
+    state = load_batch_state()
+    if not state:
+        return redirect(url_for("index"))
+    page = render_template_string(
+        PROGRESS_TEMPLATE,
+        playlist_title=state.get("playlist_title", "YouTube Playlist"),
+    )
+    return page
+
+
+@app.route("/api/batch-progress")
+def batch_progress_api():
+    return jsonify(batch_progress_snapshot())
 
 
 @app.route("/download-last", methods=["POST"])
