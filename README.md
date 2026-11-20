@@ -32,7 +32,7 @@ Complete this one-time setup:
 
 1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create or select a project.
 2. Enable **YouTube Data API v3** for the project.
-3. Open **Google Auth Platform**. For a personal, single-account installation, choose **Personal** audience mode when creating the app. This limits authorization to the Google account that created the app, but avoids the seven-day test-token expiration and the unverified-app warning. Personal mode is a one-time choice for a new project.
+3. Open **Google Auth Platform** while signed in to the same Google account that owns or manages your YouTube channel. For a personal, single-account installation, choose **Personal** audience mode when creating the app. This authorizes only that exact Google account, but avoids the seven-day test-token expiration and the unverified-app warning. Personal mode is permanent for that project; you cannot later switch it to External or Internal. Choose External instead if you need different Google accounts to authorize the app.
 4. Under **Data Access**, make sure the YouTube scope `https://www.googleapis.com/auth/youtube.force-ssl` is available.
 5. Create an OAuth client with application type **Desktop app** and download its JSON file.
 6. Rename the downloaded file to **client_secret.json** and place it in the same folder as **run.bat**.
