@@ -10,7 +10,7 @@ A small local web app that takes up to 10 public or unlisted YouTube video links
 4. On the first run, the launcher creates a local Python environment and installs the required packages. It then starts the app and opens your browser.
 5. Paste your YouTube links, one per line, and select **Download Combined Transcripts (.txt)**.
 
-The first launch needs an internet connection to install the packages. Later launches reuse the local environment and do not reinstall them unless the requirements change.
+The first launch needs an internet connection to install the packages. Later launches verify the installed requirements and only install or update packages when needed.
 
 To stop the app, close its command window or press **Ctrl+C** in that window.
 
