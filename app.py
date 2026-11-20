@@ -1463,7 +1463,10 @@ def start_batch_worker(browser=None):
         return True
     except Exception:
         BATCH_WORKER_LOCK.release()
-        raise@app.route("/", methods=["GET", "POST"])
+        raise
+
+
+@app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
         return render_page()
