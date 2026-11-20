@@ -233,14 +233,6 @@ HTML_TEMPLATE = """
         {% endif %}
         {% if batch_summary.pending %}
         <form method="POST" action="/resume-last">
-            <label for="resume_browser">Browser session (optional)</label>
-            <select id="resume_browser" name="browser">
-                <option value="">No browser cookies</option>
-                <option value="chrome" {% if batch_summary.browser == "chrome" %}selected{% endif %}>Chrome</option>
-                <option value="edge" {% if batch_summary.browser == "edge" %}selected{% endif %}>Microsoft Edge</option>
-                <option value="firefox" {% if batch_summary.browser == "firefox" %}selected{% endif %}>Firefox</option>
-            </select>
-            <p class="help">Use this when signed in to YouTube in that browser. Cookies are read locally for this run only.</p>
             <button type="submit">Resume remaining videos ({{ batch_summary.pending }})</button>
         </form>
         {% else %}
@@ -1671,10 +1663,7 @@ def resume_last_batch():
             status=400,
         )
 
-    browser = normalize_browser(request.form.get("browser", state.get("browser", "")))
-    state["browser"] = browser
-    save_batch_state(state)
-    if not start_batch_worker(browser=browser):
+    if not start_batch_worker(browser=""):
         return render_page("Another transcript batch is already running.", status=409)
     return redirect(url_for("batch_progress_page"))
 
