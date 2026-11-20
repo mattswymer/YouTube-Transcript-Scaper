@@ -1,30 +1,30 @@
+import html
+import json
 import os
 import re
+import tempfile
 import threading
 import time
 import webbrowser
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from flask import Flask, Response, render_template_string, request
+from flask import Flask, Response, jsonify, render_template_string, request, redirect, url_for
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
-from youtube_transcript_api import (
-    AgeRestricted,
-    NoTranscriptFound,
-    RequestBlocked,
-    TranscriptsDisabled,
-    VideoUnavailable,
-    YouTubeTranscriptApi,
-    YouTubeTranscriptApiException,
-)
 
 app = Flask(__name__)
 
 MAX_VIDEOS = 10
 MAX_PLAYLIST_ENTRIES = 500
 MAX_SELECTED_VIDEOS = 200
-REQUEST_DELAY_SECONDS = 1.5
+SUPPORTED_BROWSER_CHOICES = {"", "chrome", "edge", "firefox"}
+REQUEST_DELAY_SECONDS = 2.5
+SUBTITLE_REQUEST_SLEEP_SECONDS = 2.0
+DATA_DIR = Path(__file__).resolve().parent / "data"
+BATCH_STATE_PATH = DATA_DIR / "last_batch.json"
+BATCH_WORKER_LOCK = threading.Lock()
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LANGUAGE_CODE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
@@ -184,6 +184,47 @@ HTML_TEMPLATE = """
     <div class="error" role="alert">{{ error }}</div>
     {% endif %}
 
+    {% if batch_summary %}
+    <section class="section">
+        <div class="section-heading">
+            <span class="step">SAVED BATCH</span>
+            <h2>{{ batch_summary.playlist_title }}</h2>
+        </div>
+        <p class="help">
+            {{ batch_summary.completed }} transcripts saved;
+            {{ batch_summary.no_transcript }} videos have no available captions;
+            {{ batch_summary.pending }} still need processing.
+        </p>
+        {% if batch_summary.block_reason %}
+        <div class="warning">{{ batch_summary.block_reason }}</div>
+        {% endif %}
+        {% if batch_summary.pending %}
+        <form method="POST" action="/resume-last">
+            <label for="resume_browser">Browser session (optional)</label>
+            <select id="resume_browser" name="browser">
+                <option value="">No browser cookies</option>
+                <option value="chrome" {% if batch_summary.browser == "chrome" %}selected{% endif %}>Chrome</option>
+                <option value="edge" {% if batch_summary.browser == "edge" %}selected{% endif %}>Microsoft Edge</option>
+                <option value="firefox" {% if batch_summary.browser == "firefox" %}selected{% endif %}>Firefox</option>
+            </select>
+            <p class="help">Use this when signed in to YouTube in that browser. Cookies are read locally for this run only.</p>
+            <button type="submit">Resume remaining videos ({{ batch_summary.pending }})</button>
+        </form>
+        {% else %}
+        <p class="selection-summary">This batch has no remaining videos to process.</p>
+        {% endif %}
+        <div class="controls">
+            <form method="POST" action="/download-last">
+                <button class="secondary" type="submit">Download saved combined transcripts</button>
+            </form>
+            <form method="POST" action="/clear-last-batch">
+                <button class="secondary" type="submit">Clear saved batch</button>
+            </form>
+        </div>
+        <p class="help">Progress and transcript text are saved locally in the app's data folder, not uploaded anywhere.</p>
+    </section>
+    {% endif %}
+
     <section class="section">
         <div class="section-heading">
             <span class="step">OPTION 1</span>
@@ -199,6 +240,17 @@ HTML_TEMPLATE = """
                 <input id="playlist_languages" name="languages" type="text"
                        value="{{ languages }}" placeholder="en, es">
                 <p class="help">Comma-separated language codes, in preference order. English is the default.</p>
+            </div>
+
+            <div class="field">
+                <label for="playlist_browser">YouTube browser session (optional)</label>
+                <select id="playlist_browser" name="browser">
+                    <option value="">No browser cookies</option>
+                    <option value="chrome" {% if browser == "chrome" %}selected{% endif %}>Chrome</option>
+                    <option value="edge" {% if browser == "edge" %}selected{% endif %}>Microsoft Edge</option>
+                    <option value="firefox" {% if browser == "firefox" %}selected{% endif %}>Firefox</option>
+                </select>
+                <p class="help">Use a browser where you are signed in to YouTube. Cookies are read locally and are not saved.</p>
             </div>
 
             <div class="controls">
@@ -228,6 +280,7 @@ HTML_TEMPLATE = """
             <input type="hidden" name="playlist_title" value="{{ playlist_title }}">
             <input type="hidden" name="playlist_url" value="{{ playlist_url }}">
             <input type="hidden" name="languages" value="{{ languages }}">
+            <input type="hidden" name="browser" value="{{ browser }}">
             {% if include_timestamps %}
             <input type="hidden" name="timestamps" value="on">
             {% endif %}
@@ -281,6 +334,16 @@ HTML_TEMPLATE = """
                        value="{{ languages }}" placeholder="en, es">
             </div>
 
+            <div class="field">
+                <label for="single_browser">YouTube browser session (optional)</label>
+                <select id="single_browser" name="browser">
+                    <option value="">No browser cookies</option>
+                    <option value="chrome" {% if browser == "chrome" %}selected{% endif %}>Chrome</option>
+                    <option value="edge" {% if browser == "edge" %}selected{% endif %}>Microsoft Edge</option>
+                    <option value="firefox" {% if browser == "firefox" %}selected{% endif %}>Firefox</option>
+                </select>
+            </div>
+
             <div class="controls">
                 <label class="checkbox-label">
                     <input type="checkbox" name="timestamps" {% if include_timestamps %}checked{% endif %}>
@@ -294,8 +357,8 @@ HTML_TEMPLATE = """
 
     <div class="note">
         <strong>Notes:</strong> Public and unlisted playlists can be read when YouTube makes their playlist data available.
-        Private playlists and private videos require access the app does not have. A video must have captions or an available transcript.
-        YouTube may temporarily block transcript requests; the app stops the batch if that happens.
+        Private playlists and private videos require a signed-in browser session. A video must have captions or an available transcript.
+        If YouTube blocks a batch, progress is saved and the remaining videos can be resumed later.
     </div>
 
     <script>
@@ -343,6 +406,226 @@ HTML_TEMPLATE = """
 """
 
 
+
+PROGRESS_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#18181b">
+    <title>Transcript Download Progress</title>
+    <style>
+        :root { color-scheme: dark; }
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            max-width: 760px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #18181b;
+            color: #f4f4f5;
+        }
+        h1 { margin-bottom: 8px; font-size: 25px; }
+        h2 { margin: 0 0 8px; font-size: 17px; }
+        .subtitle, .muted { color: #a1a1aa; }
+        .panel {
+            margin-top: 22px;
+            padding: 20px;
+            border: 1px solid #3f3f46;
+            border-radius: 10px;
+            background: #202024;
+        }
+        .progress-heading {
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            align-items: baseline;
+            margin-bottom: 9px;
+        }
+        .progress-value { color: #c4b5fd; font-size: 13px; white-space: nowrap; }
+        .track {
+            width: 100%;
+            height: 15px;
+            overflow: hidden;
+            border-radius: 99px;
+            background: #3f3f46;
+        }
+        .fill {
+            width: 0%;
+            height: 100%;
+            border-radius: inherit;
+            background: #8b5cf6;
+            transition: width .25s ease;
+        }
+        .fill.current.indeterminate {
+            width: 35%;
+            animation: slide 1.4s ease-in-out infinite alternate;
+        }
+        @keyframes slide {
+            from { transform: translateX(-15%); }
+            to { transform: translateX(205%); }
+        }
+        .status { margin-top: 9px; color: #d4d4d8; font-size: 14px; }
+        .detail { margin-top: 5px; color: #a1a1aa; font-size: 13px; overflow-wrap: anywhere; }
+        .summary {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px 18px;
+            margin-top: 18px;
+            color: #a1a1aa;
+            font-size: 13px;
+        }
+        .summary strong { color: #f4f4f5; }
+        .notice {
+            margin-top: 16px;
+            padding: 12px 14px;
+            border-radius: 7px;
+            background: #422006;
+            color: #fde68a;
+            font-size: 13px;
+            line-height: 1.5;
+        }
+        .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+        button, a.button {
+            display: inline-block;
+            border: 0;
+            border-radius: 8px;
+            padding: 11px 16px;
+            font-size: 14px;
+            font-weight: 600;
+            color: white;
+            background: #7c3aed;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        a.secondary, button.secondary { background: #3f3f46; color: #f4f4f5; }
+        @media (max-width: 520px) {
+            body { margin: 24px auto; padding: 0 14px; }
+            .panel { padding: 16px; }
+            .actions > * { flex: 1 1 100%; text-align: center; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Downloading transcripts</h1>
+    <p class="subtitle" id="playlistTitle">{{ playlist_title }}</p>
+
+    <section class="panel">
+        <div class="progress-heading">
+            <h2>Current video</h2>
+            <span class="progress-value" id="currentPosition">Preparing…</span>
+        </div>
+        <div class="track" role="progressbar" aria-label="Current video progress">
+            <div class="fill current indeterminate" id="currentBar"></div>
+        </div>
+        <div class="status" id="currentStatus">Starting transcript retrieval…</div>
+        <div class="detail" id="currentTitle"></div>
+
+        <div style="height:26px"></div>
+
+        <div class="progress-heading">
+            <h2>All selected videos</h2>
+            <span class="progress-value" id="overallPercent">0%</span>
+        </div>
+        <div class="track" role="progressbar" aria-label="Overall batch progress">
+            <div class="fill" id="overallBar"></div>
+        </div>
+        <div class="status" id="overallStatus">0 of 0 videos processed</div>
+
+        <div class="summary">
+            <span>Transcripts: <strong id="successCount">0</strong></span>
+            <span>No captions: <strong id="noCaptionCount">0</strong></span>
+            <span>Unavailable: <strong id="unavailableCount">0</strong></span>
+            <span>Errors: <strong id="failedCount">0</strong></span>
+        </div>
+
+        <div class="notice" id="blockNotice" hidden></div>
+
+        <div class="actions">
+            <form id="downloadForm" method="POST" action="/download-last" hidden>
+                <button class="button" id="downloadButton" type="submit">Download combined transcripts</button>
+            </form>
+            <form id="resumeForm" method="POST" action="/resume-last" hidden>
+                <button type="submit">Resume remaining videos</button>
+            </form>
+            <a class="button secondary" href="/">Back to scraper</a>
+        </div>
+        <p class="muted" style="font-size:12px;margin-bottom:0">
+            This page updates automatically. You can leave it open while the batch runs.
+        </p>
+    </section>
+
+    <script>
+    (function () {
+        const currentBar = document.getElementById("currentBar");
+        const currentPosition = document.getElementById("currentPosition");
+        const currentStatus = document.getElementById("currentStatus");
+        const currentTitle = document.getElementById("currentTitle");
+        const overallBar = document.getElementById("overallBar");
+        const overallPercent = document.getElementById("overallPercent");
+        const overallStatus = document.getElementById("overallStatus");
+        const successCount = document.getElementById("successCount");
+        const noCaptionCount = document.getElementById("noCaptionCount");
+        const unavailableCount = document.getElementById("unavailableCount");
+        const failedCount = document.getElementById("failedCount");
+        const blockNotice = document.getElementById("blockNotice");
+        const downloadForm = document.getElementById("downloadForm");
+        const resumeForm = document.getElementById("resumeForm");
+
+        async function refreshProgress() {
+            try {
+                const response = await fetch("/api/batch-progress", {cache: "no-store"});
+                if (!response.ok) throw new Error("Progress request failed");
+                const data = await response.json();
+
+                const percent = Math.max(0, Math.min(100, data.percent || 0));
+                overallBar.style.width = percent + "%";
+                overallPercent.textContent = Math.round(percent) + "%";
+                overallStatus.textContent = data.processed + " of " + data.total + " videos processed";
+
+                currentPosition.textContent = data.current_index && data.total
+                    ? "Video " + data.current_index + " of " + data.total
+                    : (data.processing ? "Preparing…" : "Batch complete");
+                currentStatus.textContent = data.current_status || "Waiting";
+                currentTitle.textContent = data.current_title || "";
+
+                currentBar.classList.toggle("indeterminate", Boolean(data.processing));
+                if (!data.processing) {
+                    currentBar.style.width = (data.current_progress || 0) + "%";
+                } else {
+                    currentBar.style.width = "35%";
+                }
+
+                successCount.textContent = data.successful;
+                noCaptionCount.textContent = data.no_transcript;
+                unavailableCount.textContent = data.unavailable;
+                failedCount.textContent = data.failed;
+
+                blockNotice.hidden = !data.block_reason;
+                blockNotice.textContent = data.block_reason || "";
+
+                downloadForm.hidden = data.processing || data.total === 0;
+                resumeForm.hidden = data.processing || data.retryable === 0;
+
+                if (!data.processing && data.pending === 0) {
+                    currentStatus.textContent = data.failed
+                        ? "Finished, with some videos that can be retried."
+                        : "All selected videos have been processed.";
+                }
+                window.setTimeout(refreshProgress, data.processing ? 1000 : 5000);
+            } catch (error) {
+                currentStatus.textContent = "Connection interrupted. Checking again…";
+                window.setTimeout(refreshProgress, 2000);
+            }
+        }
+
+        refreshProgress();
+    })();
+    </script>
+</body>
+</html>
+"""
+
 def render_page(
     error=None,
     urls="",
@@ -354,7 +637,12 @@ def render_page(
     playlist_url="",
     playlist_warning="",
     selected_ids=None,
+    browser="",
+    batch_summary=None,
 ):
+    if batch_summary is None:
+        batch_summary = get_batch_summary()
+
     page = render_template_string(
         HTML_TEMPLATE,
         error=error,
@@ -366,8 +654,11 @@ def render_page(
         playlist_url=playlist_url,
         playlist_warning=playlist_warning,
         selected_ids=set(selected_ids or []),
+        browser=browser if browser in SUPPORTED_BROWSER_CHOICES else "",
+        batch_summary=batch_summary,
     )
     return page, status
+
 
 def extract_video_id(value: str):
     """Extract and validate an 11-character ID from common YouTube URL formats."""
@@ -472,7 +763,22 @@ def format_duration(seconds):
         return "Duration unavailable"
 
 
-def fetch_playlist_entries(playlist_url: str):
+def normalize_browser(value):
+    browser = (value or "").strip().lower()
+    if browser not in SUPPORTED_BROWSER_CHOICES:
+        return ""
+    return browser
+
+
+def apply_browser_cookies(options, browser):
+    browser = normalize_browser(browser)
+    if browser:
+        # yt-dlp reads the chosen browser cookie store directly for this run.
+        options["cookiesfrombrowser"] = (browser, None, None, None)
+    return options
+
+
+def fetch_playlist_entries(playlist_url: str, browser=None):
     """Read playlist metadata without downloading any video or audio."""
     if not extract_playlist_id(playlist_url):
         raise ValueError("Paste a valid YouTube playlist link containing a playlist ID.")
@@ -486,6 +792,7 @@ def fetch_playlist_entries(playlist_url: str):
         "ignoreerrors": True,
         "playlistend": MAX_PLAYLIST_ENTRIES,
     }
+    apply_browser_cookies(options, browser)
 
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(playlist_url, download=False)
@@ -588,11 +895,248 @@ def entries_from_selection_form():
     return entries
 
 
-def create_transcript_response(video_items, include_timestamps, languages, playlist_title=None):
-    """Fetch selected transcripts sequentially and return one combined text file."""
-    api = YouTubeTranscriptApi()
-    now = datetime.now().astimezone()
+class NoTranscriptAvailable(Exception):
+    """The video has no subtitle track matching the requested languages."""
 
+
+class TranscriptBlocked(Exception):
+    """YouTube temporarily blocked subtitle retrieval."""
+
+
+class TranscriptUnavailable(Exception):
+    """The video cannot be accessed with the current session."""
+
+
+def parse_subtitle_timestamp(value):
+    value = value.strip().replace(",", ".")
+    parts = value.split(":")
+    if len(parts) == 3:
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+    elif len(parts) == 2:
+        hours = 0
+        minutes = int(parts[0])
+        seconds = float(parts[1])
+    else:
+        raise ValueError("Invalid subtitle timestamp")
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def parse_subtitle_file(content, include_timestamps=True):
+    """Convert VTT/SRT caption cues into readable transcript paragraphs."""
+    cues = []
+    current_start = None
+    current_text = []
+
+    def flush():
+        nonlocal current_start, current_text
+        text = " ".join(current_text).strip()
+        if text and current_start is not None:
+            text = html.unescape(re.sub(r"<[^>]*>", "", text))
+            text = re.sub(r"\{\\[^}]*\}", "", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if text and (not cues or cues[-1][1] != text):
+                cues.append((current_start, text))
+        current_start = None
+        current_text = []
+
+    for raw_line in content.splitlines():
+        line = raw_line.strip()
+        if not line:
+            flush()
+            continue
+
+        if "-->" in line:
+            flush()
+            try:
+                current_start = parse_subtitle_timestamp(line.split("-->", 1)[0])
+            except (TypeError, ValueError):
+                current_start = None
+            continue
+
+        if (
+            line == "WEBVTT"
+            or line.startswith(("NOTE", "STYLE", "REGION", "Kind:", "Language:"))
+            or re.fullmatch(r"\d+", line)
+        ):
+            continue
+
+        if current_start is not None:
+            current_text.append(line)
+
+    flush()
+
+    if not cues:
+        raise NoTranscriptAvailable("No readable caption cues were found.")
+
+    output = []
+    paragraph = []
+    last_timestamp = -60.0
+
+    for start, text in cues:
+        if include_timestamps and start - last_timestamp >= 60:
+            if paragraph:
+                output.append(" ".join(paragraph))
+                paragraph = []
+            output.append(f"[{format_seconds(start)}]")
+            last_timestamp = start
+        paragraph.append(text)
+
+    if paragraph:
+        output.append(" ".join(paragraph))
+
+    return "\n".join(output)
+
+
+def classify_ytdlp_error(exc):
+    message = str(exc)
+    lowered = message.lower()
+
+    blocked_markers = (
+        "http error 429",
+        "too many requests",
+        "requestblocked",
+        "ipblocked",
+        "temporarily blocked",
+        "sign in to confirm you're not a bot",
+        "sign in to confirm you’re not a bot",
+        "confirm you're not a bot",
+        "confirm you’re not a bot",
+        "rate limit",
+        "http error 403",
+    )
+    unavailable_markers = (
+        "private video",
+        "video unavailable",
+        "has been removed",
+        "this video is unavailable",
+        "members-only",
+        "members only",
+    )
+
+    if any(marker in lowered for marker in blocked_markers):
+        return TranscriptBlocked(
+            "YouTube temporarily blocked subtitle retrieval. The batch has been saved; "
+            "wait before resuming, or try your signed-in browser session."
+        )
+    if any(marker in lowered for marker in unavailable_markers):
+        return TranscriptUnavailable(
+            "The video is private, removed, members-only, or unavailable to the selected session."
+        )
+    return RuntimeError(f"yt-dlp could not retrieve subtitles ({type(exc).__name__}).")
+
+
+def fetch_single_transcript(
+    video_id: str,
+    include_timestamps: bool,
+    languages=None,
+    browser=None,
+) -> str:
+    """Retrieve caption files through yt-dlp without downloading video/audio."""
+    requested_languages = languages or ["en"]
+    language_patterns = [f"{re.escape(language)}.*" for language in requested_languages]
+
+    with tempfile.TemporaryDirectory(prefix="youtube-transcript-") as temp_dir:
+        output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "no_color": True,
+            "skip_download": True,
+            "writesubtitles": True,
+            "writeautomaticsub": True,
+            "subtitleslangs": language_patterns,
+            "subtitlesformat": "vtt/best",
+            "outtmpl": output_template,
+            "socket_timeout": 30,
+            "retries": 2,
+            "extractor_retries": 1,
+            "sleep_interval_requests": 1.0,
+            "sleep_interval_subtitles": SUBTITLE_REQUEST_SLEEP_SECONDS,
+            "noplaylist": True,
+        }
+        apply_browser_cookies(options, browser)
+
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(
+                    f"https://www.youtube.com/watch?v={video_id}",
+                    download=True,
+                )
+        except DownloadError as exc:
+            raise classify_ytdlp_error(exc) from exc
+
+        candidates = []
+        requested_subtitles = (info or {}).get("requested_subtitles") or {}
+
+        for language in requested_languages:
+            for code, subtitle in requested_subtitles.items():
+                if code.lower() == language.lower() or code.lower().startswith(language.lower() + "-"):
+                    filepath = subtitle.get("filepath")
+                    if filepath and os.path.isfile(filepath):
+                        candidates.append(Path(filepath))
+                    elif subtitle.get("data"):
+                        return parse_subtitle_file(
+                            subtitle["data"], include_timestamps=include_timestamps
+                        )
+
+        files = list(Path(temp_dir).rglob("*.vtt")) + list(Path(temp_dir).rglob("*.srt"))
+        for language in requested_languages:
+            preferred = [
+                path for path in files
+                if path.stem.split(".")[-1].lower() == language.lower()
+                or path.stem.split(".")[-1].lower().startswith(language.lower() + "-")
+            ]
+            for path in preferred:
+                if path not in candidates:
+                    candidates.append(path)
+
+        for path in files:
+            if path not in candidates:
+                candidates.append(path)
+
+        if not candidates:
+            raise NoTranscriptAvailable(
+                "No subtitles or automatically generated captions are available "
+                "in the requested language(s)."
+            )
+
+        for path in candidates:
+            try:
+                content = path.read_text(encoding="utf-8-sig")
+                return parse_subtitle_file(content, include_timestamps=include_timestamps)
+            except (OSError, UnicodeError, NoTranscriptAvailable):
+                continue
+
+        raise NoTranscriptAvailable("No readable subtitles were returned for this video.")
+
+
+def describe_transcript_error(exc: Exception) -> str:
+    if isinstance(exc, TranscriptBlocked):
+        return str(exc)
+    if isinstance(exc, NoTranscriptAvailable):
+        return "Captions and transcripts are disabled or unavailable in the requested language(s)."
+    if isinstance(exc, TranscriptUnavailable):
+        return str(exc)
+    if isinstance(exc, DownloadError):
+        return str(classify_ytdlp_error(exc))
+    return f"An unexpected error occurred ({type(exc).__name__})."
+
+
+def make_text_download(content, filename=None):
+    now = datetime.now().astimezone()
+    filename = filename or f"dnd_transcripts_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+    return Response(
+        content,
+        mimetype="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def create_transcript_response(video_items, include_timestamps, languages, playlist_title=None, browser=None):
+    """Fetch a small individual-link batch sequentially."""
+    now = datetime.now().astimezone()
     heading = "D&D CAMPAIGN SESSION TRANSCRIPTS"
     if playlist_title:
         heading += f"\nPlaylist: {playlist_title}"
@@ -607,8 +1151,8 @@ def create_transcript_response(video_items, include_timestamps, languages, playl
 
     for index, item in enumerate(video_items, start=1):
         video_id = item["video_id"]
-        url = f"https://www.youtube.com/watch?v={video_id}"
         title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:300]
+        url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
 
         if not video_id:
             output_sections.append(
@@ -619,10 +1163,9 @@ def create_transcript_response(video_items, include_timestamps, languages, playl
             continue
 
         try:
-            body = fetch_single_transcript(api, video_id, include_timestamps, languages)
-            if not body:
-                body = "[No transcript text was returned for this video.]"
-
+            body = fetch_single_transcript(
+                video_id, include_timestamps, languages, browser=browser
+            )
             label = f" | {title}" if title else ""
             output_sections.append(
                 f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n\n"
@@ -635,8 +1178,7 @@ def create_transcript_response(video_items, include_timestamps, languages, playl
                 f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n"
                 f"[Error: {message}]\n"
             )
-
-            if isinstance(exc, RequestBlocked):
+            if isinstance(exc, TranscriptBlocked):
                 for skipped_index, skipped_item in enumerate(video_items[index:], start=index + 1):
                     output_sections.append(
                         f"=== VIDEO {skipped_index} | Video ID: {skipped_item['video_id']} ===\n"
@@ -647,66 +1189,281 @@ def create_transcript_response(video_items, include_timestamps, languages, playl
         if index < len(video_items):
             time.sleep(REQUEST_DELAY_SECONDS)
 
-    combined_text = "\n\n".join(output_sections).rstrip() + "\n"
-    filename = f"dnd_transcripts_{now.strftime('%Y%m%d_%H%M%S')}.txt"
+    content = "\n\n".join(output_sections).rstrip() + "\n"
+    return make_text_download(content)
 
-    return Response(
-        combined_text,
-        mimetype="text/plain; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+
+def save_batch_state(state):
+    BATCH_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = BATCH_STATE_PATH.with_suffix(".tmp")
+    temporary_path.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
+    os.replace(temporary_path, BATCH_STATE_PATH)
 
 
-def fetch_single_transcript(
-    api: YouTubeTranscriptApi,
-    video_id: str,
-    include_timestamps: bool,
-    languages=None,
-) -> str:
-    transcript = api.fetch(video_id, languages=languages or ["en"])
-    lines = []
-    current_paragraph = []
-    last_timestamp = -60.0
+def load_batch_state():
+    try:
+        return json.loads(BATCH_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
 
-    for snippet in transcript:
-        start = float(snippet.start or 0)
-        text = re.sub(r"\s+", " ", (snippet.text or "")).strip()
-        if not text:
+
+def clear_batch_state():
+    try:
+        BATCH_STATE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def get_batch_summary():
+    state = load_batch_state()
+    if not state:
+        return None
+
+    videos = state.get("videos") or []
+    statuses = [item.get("status", "pending") for item in videos]
+    return {
+        "playlist_title": state.get("playlist_title") or "Last playlist batch",
+        "total": len(videos),
+        "completed": statuses.count("complete"),
+        "no_transcript": statuses.count("no_transcript"),
+        "unavailable": statuses.count("unavailable"),
+        "pending": statuses.count("pending") + statuses.count("failed"),
+        "browser": state.get("browser", ""),
+        "block_reason": state.get("block_reason", ""),
+    }
+
+
+def build_batch_export(state):
+    now = datetime.now().astimezone()
+    videos = state.get("videos") or []
+    sections = [
+        "D&D CAMPAIGN SESSION TRANSCRIPTS",
+        f"Playlist: {state.get('playlist_title', 'YouTube Playlist')}",
+        f"Exported: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"Videos selected: {len(videos)}",
+        "=" * 60,
+        "",
+    ]
+
+    for index, item in enumerate(videos, start=1):
+        video_id = item.get("video_id", "")
+        title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:300]
+        url = f"https://www.youtube.com/watch?v={video_id}" if video_id else ""
+        label = f" | {title}" if title else ""
+        status = item.get("status", "pending")
+
+        if status == "complete":
+            sections.append(
+                f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n\n"
+                f"{item.get('transcript', '')}\n"
+            )
+        elif status == "no_transcript":
+            sections.append(
+                f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n"
+                "[No captions or transcripts were available in the requested language(s).]\n"
+            )
+        elif status == "unavailable":
+            sections.append(
+                f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n"
+                f"[Unavailable: {item.get('error', 'Video unavailable.') }]\n"
+            )
+        elif status == "failed":
+            sections.append(
+                f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n"
+                f"[Error: {item.get('error', 'Transcript retrieval failed.') }]\n"
+            )
+        else:
+            sections.append(
+                f"=== VIDEO {index} | Video ID: {video_id}{label} | {url} ===\n"
+                "[Pending: this video has not been processed yet. Use Resume remaining videos.]\n"
+            )
+
+    return "\n\n".join(sections).rstrip() + "\n"
+
+
+def process_saved_batch(state, browser=None):
+    browser = normalize_browser(browser if browser is not None else state.get("browser"))
+    state["browser"] = browser
+    state["block_reason"] = ""
+    state["is_processing"] = True
+    state.setdefault("current_video_index", 0)
+    state.setdefault("current_video_title", "")
+    state.setdefault("current_video_status", "Starting batch")
+    state.setdefault("current_video_progress", 0)
+    save_batch_state(state)
+
+    videos = state.get("videos") or []
+    for index, item in enumerate(videos):
+        if item.get("status") not in ("pending", "failed"):
             continue
 
-        if include_timestamps and start - last_timestamp >= 60:
-            if current_paragraph:
-                lines.append(" ".join(current_paragraph))
-                current_paragraph = []
-            lines.append(f"[{format_seconds(start)}]")
-            last_timestamp = start
+        state["current_video_index"] = index + 1
+        state["current_video_title"] = item.get("title") or item.get("video_id")
+        state["current_video_status"] = "Requesting captions from YouTube…"
+        state["current_video_progress"] = 15
+        item["status"] = "pending"
+        save_batch_state(state)
 
-        current_paragraph.append(text)
+        try:
+            state["current_video_status"] = "Retrieving and formatting captions…"
+            state["current_video_progress"] = 45
+            save_batch_state(state)
 
-    if current_paragraph:
-        lines.append(" ".join(current_paragraph))
+            transcript = fetch_single_transcript(
+                item["video_id"],
+                bool(state.get("include_timestamps", True)),
+                state.get("languages") or ["en"],
+                browser=browser,
+            )
+            state["current_video_status"] = "Saving transcript…"
+            state["current_video_progress"] = 90
+            save_batch_state(state)
 
-    return "\n".join(lines)
+            item["status"] = "complete"
+            item["transcript"] = transcript
+            item["error"] = ""
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "Transcript saved"
+        except NoTranscriptAvailable as exc:
+            item["status"] = "no_transcript"
+            item["error"] = str(exc)
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "No captions available"
+        except TranscriptUnavailable as exc:
+            item["status"] = "unavailable"
+            item["error"] = str(exc)
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "Video unavailable"
+        except TranscriptBlocked as exc:
+            item["status"] = "pending"
+            item["error"] = str(exc)
+            state["block_reason"] = str(exc)
+            state["current_video_status"] = "Paused — YouTube blocked the request"
+            state["is_processing"] = False
+            save_batch_state(state)
+            break
+        except Exception as exc:
+            item["status"] = "failed"
+            item["error"] = describe_transcript_error(exc)
+            state["current_video_progress"] = 100
+            state["current_video_status"] = "This video failed; continuing to the next"
+
+        save_batch_state(state)
+
+        if index < len(videos) - 1:
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+    state["updated_at"] = datetime.now().astimezone().isoformat()
+    state["is_processing"] = False
+    if not state.get("block_reason"):
+        state["current_video_status"] = "Batch finished"
+        state["current_video_progress"] = 100
+    save_batch_state(state)
+
+    filename = f"dnd_transcripts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    return make_text_download(build_batch_export(state), filename)
 
 
-def describe_transcript_error(exc: Exception) -> str:
-    """Convert known API failures into messages a user can act on."""
-    if isinstance(exc, RequestBlocked):
-        return (
-            "YouTube is temporarily blocking transcript requests from this network. "
-            "The batch was stopped to avoid sending more requests. Try again later."
+def batch_progress_snapshot():
+    state = load_batch_state()
+    if not state:
+        return {
+            "exists": False,
+            "processing": False,
+            "total": 0,
+            "processed": 0,
+            "pending": 0,
+            "retryable": 0,
+            "percent": 0,
+            "successful": 0,
+            "no_transcript": 0,
+            "unavailable": 0,
+            "failed": 0,
+            "current_index": 0,
+            "current_title": "",
+            "current_status": "No batch loaded",
+            "current_progress": 0,
+            "block_reason": "",
+        }
+
+    videos = state.get("videos") or []
+    statuses = [item.get("status", "pending") for item in videos]
+    total = len(videos)
+    pending = statuses.count("pending")
+    successful = statuses.count("complete")
+    no_transcript = statuses.count("no_transcript")
+    unavailable = statuses.count("unavailable")
+    failed = statuses.count("failed")
+    processed = total - pending
+    percent = round(processed * 100 / total) if total else 0
+
+    return {
+        "exists": True,
+        "playlist_title": state.get("playlist_title", "YouTube Playlist"),
+        "processing": bool(state.get("is_processing")),
+        "total": total,
+        "processed": processed,
+        "pending": pending,
+        "retryable": pending + failed,
+        "percent": percent,
+        "successful": successful,
+        "no_transcript": no_transcript,
+        "unavailable": unavailable,
+        "failed": failed,
+        "current_index": state.get("current_video_index", 0),
+        "current_title": state.get("current_video_title", ""),
+        "current_status": state.get("current_video_status", ""),
+        "current_progress": state.get("current_video_progress", 0),
+        "block_reason": state.get("block_reason", ""),
+    }
+
+
+def _run_batch_worker(browser=None):
+    try:
+        state = load_batch_state()
+        if state:
+            process_saved_batch(state, browser=browser)
+    except Exception as exc:
+        state = load_batch_state()
+        if state:
+            state["is_processing"] = False
+            state["current_video_status"] = f"Batch stopped unexpectedly ({type(exc).__name__})"
+            state["block_reason"] = str(exc)
+            save_batch_state(state)
+    finally:
+        BATCH_WORKER_LOCK.release()
+
+
+def start_batch_worker(browser=None):
+    """Run the long playlist batch outside the request so the page can poll progress."""
+    if not BATCH_WORKER_LOCK.acquire(blocking=False):
+        return False
+
+    try:
+        state = load_batch_state()
+        if not state:
+            BATCH_WORKER_LOCK.release()
+            return False
+
+        state["is_processing"] = True
+        state["browser"] = normalize_browser(browser if browser is not None else state.get("browser"))
+        state["current_video_status"] = "Starting batch…"
+        save_batch_state(state)
+
+        worker = threading.Thread(
+            target=_run_batch_worker,
+            args=(state["browser"],),
+            daemon=True,
+            name="transcript-batch-worker",
         )
-    if isinstance(exc, AgeRestricted):
-        return "YouTube marked this video as age-restricted, so its transcript could not be retrieved."
-    if isinstance(exc, TranscriptsDisabled):
-        return "Captions and transcripts are disabled for this video."
-    if isinstance(exc, NoTranscriptFound):
-        return "No transcript was found in the requested language(s). Try another language code."
-    if isinstance(exc, VideoUnavailable):
-        return "The video is unavailable or private. Unlisted videos are supported."
-    if isinstance(exc, YouTubeTranscriptApiException):
-        return f"The transcript service could not retrieve this video ({type(exc).__name__})."
-    return f"An unexpected error occurred ({type(exc).__name__})."
+        worker.start()
+        return True
+    except Exception:
+        BATCH_WORKER_LOCK.release()
+        raise
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -718,6 +1475,7 @@ def index():
     include_timestamps = "timestamps" in request.form
     urls = [line.strip() for line in raw_urls.splitlines() if line.strip()]
     raw_languages = request.form.get("languages", "en")
+    browser = normalize_browser(request.form.get("browser", ""))
 
     if not urls:
         return render_page(
@@ -748,7 +1506,9 @@ def index():
         video_id = extract_video_id(url)
         video_items.append({"video_id": video_id or "", "title": url})
 
-    return create_transcript_response(video_items, include_timestamps, languages)
+    return create_transcript_response(
+        video_items, include_timestamps, languages, browser=browser
+    )
 
 
 @app.route("/load-playlist", methods=["POST"])
@@ -756,6 +1516,7 @@ def load_playlist():
     playlist_url = request.form.get("playlist_url", "").strip()
     raw_languages = request.form.get("languages", "en")
     include_timestamps = "timestamps" in request.form
+    browser = normalize_browser(request.form.get("browser", ""))
 
     if not extract_playlist_id(playlist_url):
         return render_page(
@@ -768,13 +1529,14 @@ def load_playlist():
 
     try:
         languages = parse_languages(raw_languages)
-        playlist = fetch_playlist_entries(playlist_url)
+        playlist = fetch_playlist_entries(playlist_url, browser=browser)
     except ValueError as exc:
         return render_page(
             str(exc),
             languages=raw_languages,
             include_timestamps=include_timestamps,
             playlist_url=playlist_url,
+            browser=browser,
             status=400,
         )
     except DownloadError:
@@ -784,6 +1546,7 @@ def load_playlist():
             languages=raw_languages,
             include_timestamps=include_timestamps,
             playlist_url=playlist_url,
+            browser=browser,
             status=400,
         )
     except Exception as exc:
@@ -792,11 +1555,13 @@ def load_playlist():
             languages=raw_languages,
             include_timestamps=include_timestamps,
             playlist_url=playlist_url,
+            browser=browser,
             status=400,
         )
 
     return render_page(
         languages=", ".join(languages),
+        browser=browser,
         include_timestamps=include_timestamps,
         playlist_entries=playlist["entries"],
         playlist_title=playlist["title"],
@@ -818,6 +1583,7 @@ def download_playlist():
     playlist_url = request.form.get("playlist_url", "")
     raw_languages = request.form.get("languages", "en")
     include_timestamps = "timestamps" in request.form
+    browser = normalize_browser(request.form.get("browser", ""))
 
     if not selected_entries:
         return render_page(
@@ -856,12 +1622,79 @@ def download_playlist():
             status=400,
         )
 
-    return create_transcript_response(
-        selected_entries,
-        include_timestamps,
-        languages,
-        playlist_title=playlist_title,
+    state = {
+        "playlist_title": playlist_title,
+        "playlist_url": playlist_url,
+        "languages": languages,
+        "include_timestamps": include_timestamps,
+        "browser": browser,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "block_reason": "",
+        "is_processing": False,
+        "current_video_index": 0,
+        "current_video_title": "",
+        "current_video_status": "Queued",
+        "current_video_progress": 0,
+        "videos": [
+            {
+                **entry,
+                "status": "pending",
+                "transcript": "",
+                "error": "",
+            }
+            for entry in selected_entries
+        ],
+    }
+    save_batch_state(state)
+    if not start_batch_worker(browser=browser):
+        return render_page("Another transcript batch is already running.", status=409)
+    return redirect(url_for("batch_progress_page"))
+
+
+@app.route("/resume-last", methods=["POST"])
+def resume_last_batch():
+    state = load_batch_state()
+    if not state:
+        return render_page("There is no saved batch to resume.", status=400)
+
+    browser = normalize_browser(request.form.get("browser", state.get("browser", "")))
+    state["browser"] = browser
+    save_batch_state(state)
+    if not start_batch_worker(browser=browser):
+        return render_page("Another transcript batch is already running.", status=409)
+    return redirect(url_for("batch_progress_page"))
+
+
+@app.route("/batch-progress")
+def batch_progress_page():
+    state = load_batch_state()
+    if not state:
+        return redirect(url_for("index"))
+    page = render_template_string(
+        PROGRESS_TEMPLATE,
+        playlist_title=state.get("playlist_title", "YouTube Playlist"),
     )
+    return page
+
+
+@app.route("/api/batch-progress")
+def batch_progress_api():
+    return jsonify(batch_progress_snapshot())
+
+
+@app.route("/download-last", methods=["POST"])
+def download_last_batch():
+    state = load_batch_state()
+    if not state:
+        return render_page("There is no saved batch to download.", status=400)
+    filename = f"dnd_transcripts_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    return make_text_download(build_batch_export(state), filename)
+
+
+@app.route("/clear-last-batch", methods=["POST"])
+def clear_last_batch():
+    clear_batch_state()
+    return redirect(url_for("index"))
 
 
 if __name__ == "__main__":

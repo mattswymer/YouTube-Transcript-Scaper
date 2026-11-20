@@ -1,5 +1,7 @@
+import json
+import tempfile
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import patch
 
 import app
@@ -105,15 +107,25 @@ class PlaylistUrlTests(unittest.TestCase):
             )
 
         self.assertEqual(result["title"], "Monday Campaign")
-        self.assertEqual([item["video_id"] for item in result["entries"]], [
-            "abcdefghijk", "lmnopqrstuv"
-        ])
+        self.assertEqual(
+            [item["video_id"] for item in result["entries"]],
+            ["abcdefghijk", "lmnopqrstuv"],
+        )
         self.assertEqual(result["entries"][0]["duration_display"], "01:01:01")
         self.assertEqual(result["entries"][1]["playlist_index"], 3)
         self.assertIn("1 unavailable", result["warning"])
         self.assertTrue(FakeYoutubeDL.options["skip_download"])
         self.assertEqual(FakeYoutubeDL.options["extract_flat"], "in_playlist")
         self.assertEqual(FakeYoutubeDL.options["playlistend"], app.MAX_PLAYLIST_ENTRIES)
+
+    def test_browser_cookies_are_added_only_when_requested(self):
+        options = {"quiet": True}
+        app.apply_browser_cookies(options, "chrome")
+        self.assertEqual(options["cookiesfrombrowser"], ("chrome", None, None, None))
+
+        options = {"quiet": True}
+        app.apply_browser_cookies(options, "")
+        self.assertNotIn("cookiesfrombrowser", options)
 
     def test_invalid_playlist_link_does_not_call_ytdlp(self):
         with patch("app.YoutubeDL") as ytdlp:
@@ -122,61 +134,204 @@ class PlaylistUrlTests(unittest.TestCase):
         ytdlp.assert_not_called()
 
 
-class LanguageTests(unittest.TestCase):
-    def test_default_language(self):
-        self.assertEqual(app.parse_languages(""), ["en"])
-        self.assertEqual(app.parse_languages("   "), ["en"])
+class SubtitleParsingTests(unittest.TestCase):
+    def test_vtt_parser_adds_approximately_minute_timestamps(self):
+        content = """WEBVTT
 
-    def test_parses_priority_and_removes_duplicates(self):
-        self.assertEqual(app.parse_languages("en, es;en fr"), ["en", "es", "fr"])
+00:00:00.000 --> 00:00:05.000 align:start
+First line
 
-    def test_rejects_malformed_language_codes(self):
-        with self.assertRaises(ValueError):
-            app.parse_languages("english, @@")
+00:00:20.000 --> 00:00:25.000
+second <c>line</c>
 
+00:01:01.000 --> 00:01:04.000
+third &amp; final
 
-class TranscriptFormattingTests(unittest.TestCase):
-    def setUp(self):
-        self.snippets = [
-            SimpleNamespace(start=0, text="First line"),
-            SimpleNamespace(start=20, text="second\nline"),
-            SimpleNamespace(start=61, text="third"),
-            SimpleNamespace(start=122, text="fourth"),
-        ]
-
-    def test_timestamps_are_added_at_roughly_one_minute_intervals(self):
-        snippets = self.snippets
-
-        class FakeApi:
-            def fetch(self, video_id, languages):
-                self.video_id = video_id
-                self.languages = languages
-                return snippets
-
-        api = FakeApi()
-        result = app.fetch_single_transcript(api, "abcdefghijk", True, ["en", "es"])
-
-        self.assertEqual(api.video_id, "abcdefghijk")
-        self.assertEqual(api.languages, ["en", "es"])
+"""
+        result = app.parse_subtitle_file(content, include_timestamps=True)
         self.assertEqual(
             result,
-            "[00:00:00]\nFirst line second line\n[00:01:01]\nthird\n[00:02:02]\nfourth",
+            "[00:00:00]\nFirst line second line\n[00:01:01]\nthird & final",
         )
 
-    def test_timestamps_can_be_disabled(self):
-        snippets = self.snippets
+    def test_vtt_parser_can_omit_timestamps(self):
+        content = """WEBVTT
 
-        class FakeApi:
-            def fetch(self, video_id, languages):
-                return snippets
+00:00:00.000 --> 00:00:02.000
+First
 
-        result = app.fetch_single_transcript(FakeApi(), "abcdefghijk", False)
-        self.assertEqual(result, "First line second line third fourth")
+00:00:05.000 --> 00:00:07.000
+Second
+"""
+        self.assertEqual(
+            app.parse_subtitle_file(content, include_timestamps=False),
+            "First Second",
+        )
+
+    def test_empty_subtitle_file_is_reported_as_unavailable(self):
+        with self.assertRaises(app.NoTranscriptAvailable):
+            app.parse_subtitle_file("WEBVTT\n\n")
+
+    def test_http_429_is_classified_as_blocked(self):
+        exc = app.classify_ytdlp_error(Exception("HTTP Error 429: Too Many Requests"))
+        self.assertIsInstance(exc, app.TranscriptBlocked)
+
+
+class TranscriptRetrievalTests(unittest.TestCase):
+    def test_ytdlp_retrieves_subtitles_without_downloading_video(self):
+        class FakeYoutubeDL:
+            options = None
+
+            def __init__(self, options):
+                FakeYoutubeDL.options = options
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def extract_info(self, url, download):
+                self.url = url
+                self.download = download
+                output_template = FakeYoutubeDL.options["outtmpl"]
+                vtt_path = Path(output_template.replace(
+                    "%(id)s.%(ext)s", "abcdefghijk.en.vtt"
+                ))
+                vtt_path.parent.mkdir(parents=True, exist_ok=True)
+                vtt_path.write_text(
+                    "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nA transcript line.\n",
+                    encoding="utf-8",
+                )
+                return {"requested_subtitles": {}}
+
+        with patch("app.YoutubeDL", FakeYoutubeDL):
+            transcript = app.fetch_single_transcript(
+                "abcdefghijk",
+                include_timestamps=True,
+                languages=["en"],
+                browser="edge",
+            )
+
+        self.assertEqual(transcript, "[00:00:00]\nA transcript line.")
+        self.assertTrue(FakeYoutubeDL.options["skip_download"])
+        self.assertTrue(FakeYoutubeDL.options["writesubtitles"])
+        self.assertTrue(FakeYoutubeDL.options["writeautomaticsub"])
+        self.assertEqual(
+            FakeYoutubeDL.options["cookiesfrombrowser"],
+            ("edge", None, None, None),
+        )
+        self.assertNotIn("format", FakeYoutubeDL.options)
+
+    def test_blocked_download_message_suggests_local_browser_session(self):
+        message = str(
+            app.classify_ytdlp_error(
+                Exception("Sign in to confirm you're not a bot")
+            )
+        ).lower()
+        self.assertIn("browser session", message)
+
+
+class BatchResumeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.state_path = Path(self.temp_dir.name) / "last_batch.json"
+        self.path_patcher = patch("app.BATCH_STATE_PATH", self.state_path)
+        self.path_patcher.start()
+        self.delay_patcher = patch("app.time.sleep")
+        self.delay_patcher.start()
+
+    def tearDown(self):
+        self.delay_patcher.stop()
+        self.path_patcher.stop()
+        self.temp_dir.cleanup()
+
+    def make_state(self):
+        return {
+            "playlist_title": "Monday Campaign",
+            "playlist_url": "https://www.youtube.com/playlist?list=PLabcdefghij",
+            "languages": ["en"],
+            "include_timestamps": True,
+            "browser": "",
+            "videos": [
+                {
+                    "video_id": "abcdefghijk",
+                    "title": "Session One",
+                    "status": "pending",
+                    "transcript": "",
+                    "error": "",
+                },
+                {
+                    "video_id": "lmnopqrstuv",
+                    "title": "Session Two",
+                    "status": "pending",
+                    "transcript": "",
+                    "error": "",
+                },
+                {
+                    "video_id": "zyxwvutsrqp",
+                    "title": "Session Three",
+                    "status": "pending",
+                    "transcript": "",
+                    "error": "",
+                },
+            ],
+        }
+
+    def test_blocked_batch_saves_completed_transcripts_and_resume_only_retries_pending(self):
+        state = self.make_state()
+        app.save_batch_state(state)
+
+        with patch(
+            "app.fetch_single_transcript",
+            side_effect=[
+                "Transcript one",
+                app.TranscriptBlocked("YouTube temporarily blocked this request."),
+                "Transcript two",
+                "Transcript three",
+            ],
+        ) as fetch:
+            app.process_saved_batch(state, browser="")
+            saved = app.load_batch_state()
+
+            self.assertEqual(saved["videos"][0]["status"], "complete")
+            self.assertEqual(saved["videos"][0]["transcript"], "Transcript one")
+            self.assertEqual(saved["videos"][1]["status"], "pending")
+            self.assertEqual(saved["videos"][2]["status"], "pending")
+            self.assertEqual(fetch.call_count, 2)
+
+            app.process_saved_batch(saved, browser="chrome")
+            completed = app.load_batch_state()
+
+        self.assertEqual(fetch.call_count, 4)
+        self.assertEqual([item["status"] for item in completed["videos"]], [
+            "complete", "complete", "complete"
+        ])
+        self.assertEqual(completed["videos"][0]["transcript"], "Transcript one")
+        self.assertEqual(completed["videos"][1]["transcript"], "Transcript two")
+        self.assertEqual(completed["videos"][2]["transcript"], "Transcript three")
+
+    def test_export_contains_success_no_caption_and_pending_sections(self):
+        state = self.make_state()
+        state["videos"][0].update(status="complete", transcript="A transcript.")
+        state["videos"][1].update(status="no_transcript")
+        content = app.build_batch_export(state)
+        self.assertIn("A transcript.", content)
+        self.assertIn("No captions or transcripts", content)
+        self.assertIn("Pending:", content)
 
 
 class FlaskRouteTests(unittest.TestCase):
     def setUp(self):
         self.client = app.app.test_client()
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.state_path = Path(self.temp_dir.name) / "last_batch.json"
+        self.path_patcher = patch("app.BATCH_STATE_PATH", self.state_path)
+        self.path_patcher.start()
+
+    def tearDown(self):
+        self.path_patcher.stop()
+        self.temp_dir.cleanup()
 
     def test_home_page_loads_with_playlist_and_individual_options(self):
         response = self.client.get("/")
@@ -184,6 +339,7 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"D&D Session Transcript Scraper", response.data)
         self.assertIn(b"Load playlist videos", response.data)
         self.assertIn(b"Paste individual video links", response.data)
+        self.assertIn(b"Chrome", response.data)
 
     def test_rejects_more_than_ten_individual_links(self):
         response = self.client.post("/", data={"urls": "\n".join(["abcdefghijk"] * 11)})
@@ -215,6 +371,7 @@ class FlaskRouteTests(unittest.TestCase):
                 data={
                     "playlist_url": "https://www.youtube.com/playlist?list=PLabcdefghij",
                     "languages": "en",
+                    "browser": "chrome",
                     "timestamps": "on",
                 },
             )
@@ -224,6 +381,7 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"Session One", response.data)
         self.assertIn(b"Session Two", response.data)
         self.assertIn(b"Select visible", response.data)
+        self.assertIn(b'value="chrome"', response.data)
 
     def test_rejects_invalid_playlist_before_extraction(self):
         with patch("app.fetch_playlist_entries") as fetch:
@@ -236,37 +394,80 @@ class FlaskRouteTests(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_downloads_only_selected_playlist_videos_in_playlist_order(self):
-        snippets = [SimpleNamespace(start=0, text="Transcript text.")]
+        with patch("app.start_batch_worker", return_value=True) as start_worker:
+            response = self.client.post(
+                "/download-playlist",
+                data={
+                    "playlist_title": "Monday Campaign",
+                    "playlist_url": "https://www.youtube.com/playlist?list=PLabcdefghij",
+                    "languages": "en",
+                    "timestamps": "on",
+                    "playlist_video_ids": ["abcdefghijk", "lmnopqrstuv"],
+                    "selected_video_ids": ["lmnopqrstuv", "abcdefghijk"],
+                    "title__abcdefghijk": "Session One",
+                    "title__lmnopqrstuv": "Session Two",
+                    "duration__abcdefghijk": "01:00:00",
+                    "duration__lmnopqrstuv": "00:45:00",
+                },
+            )
 
-        class FakeApi:
-            def fetch(self, video_id, languages):
-                return snippets
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/batch-progress"))
+        start_worker.assert_called_once_with(browser="")
+        saved = app.load_batch_state()
+        self.assertEqual([item["status"] for item in saved["videos"]], [
+            "pending", "pending"
+        ])
+        self.assertEqual([item["title"] for item in saved["videos"]], [
+            "Session One", "Session Two"
+        ])
 
-        with patch("app.YouTubeTranscriptApi", return_value=FakeApi()):
-            with patch("app.time.sleep"):
-                response = self.client.post(
-                    "/download-playlist",
-                    data={
-                        "playlist_title": "Monday Campaign",
-                        "playlist_url": "https://www.youtube.com/playlist?list=PLabcdefghij",
-                        "languages": "en",
-                        "timestamps": "on",
-                        "playlist_video_ids": ["abcdefghijk", "lmnopqrstuv"],
-                        "selected_video_ids": ["lmnopqrstuv", "abcdefghijk"],
-                        "title__abcdefghijk": "Session One",
-                        "title__lmnopqrstuv": "Session Two",
-                        "duration__abcdefghijk": "01:00:00",
-                        "duration__lmnopqrstuv": "00:45:00",
-                    },
-                )
+    def test_progress_page_has_separate_current_and_overall_bars(self):
+        state = {
+            "playlist_title": "Monday Campaign",
+            "is_processing": True,
+            "videos": [
+                {"video_id": "abcdefghijk", "title": "Session One", "status": "pending"},
+            ],
+        }
+        app.save_batch_state(state)
 
+        response = self.client.get("/batch-progress")
         self.assertEqual(response.status_code, 200)
-        content = response.get_data(as_text=True)
-        self.assertIn("Playlist: Monday Campaign", content)
-        self.assertIn("Session One", content)
-        self.assertIn("Session Two", content)
-        self.assertLess(content.index("Session One"), content.index("Session Two"))
-        self.assertEqual(response.mimetype, "text/plain")
+        self.assertIn(b"Current video", response.data)
+        self.assertIn(b"All selected videos", response.data)
+        self.assertIn(b"/api/batch-progress", response.data)
+
+    def test_progress_api_reports_file_and_batch_counts(self):
+        state = {
+            "playlist_title": "Monday Campaign",
+            "is_processing": True,
+            "current_video_index": 3,
+            "current_video_title": "Session Three",
+            "current_video_status": "Retrieving captions",
+            "current_video_progress": 45,
+            "videos": [
+                {"video_id": "abcdefghijk", "status": "complete"},
+                {"video_id": "lmnopqrstuv", "status": "no_transcript"},
+                {"video_id": "zyxwvutsrqp", "status": "pending"},
+                {"video_id": "zyxwvutsrqq", "status": "pending"},
+            ],
+        }
+        app.save_batch_state(state)
+
+        response = self.client.get("/api/batch-progress")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["processing"])
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(data["processed"], 2)
+        self.assertEqual(data["percent"], 50)
+        self.assertEqual(data["current_index"], 3)
+        self.assertEqual(data["current_title"], "Session Three")
+        self.assertEqual(data["current_progress"], 45)
+        self.assertEqual(data["successful"], 1)
+        self.assertEqual(data["no_transcript"], 1)
+        self.assertEqual(data["pending"], 2)
 
     def test_playlist_download_requires_a_selection(self):
         response = self.client.post(
@@ -281,31 +482,67 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn(b"Select at least one video", response.data)
 
+    def test_home_page_shows_resume_button_for_saved_pending_batch(self):
+        state = self.make_state_for_route()
+        app.save_batch_state(state)
+        response = self.client.get("/")
+        self.assertIn(b"Resume remaining videos (1)", response.data)
+
+    def make_state_for_route(self):
+        return {
+            "playlist_title": "Saved Campaign",
+            "videos": [
+                {"video_id": "abcdefghijk", "title": "Done", "status": "complete"},
+                {"video_id": "lmnopqrstuv", "title": "Pending", "status": "pending"},
+            ],
+            "browser": "",
+            "block_reason": "YouTube blocked the last request.",
+        }
+
+    def test_resume_route_starts_worker_and_returns_to_progress_page(self):
+        state = self.make_state_for_route()
+        app.save_batch_state(state)
+
+        with patch("app.start_batch_worker", return_value=True) as start_worker:
+            response = self.client.post(
+                "/resume-last",
+                data={"browser": "firefox"},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/batch-progress"))
+        start_worker.assert_called_once_with(browser="firefox")
+        self.assertEqual(app.load_batch_state()["videos"][1]["status"], "pending")
+
+    def test_download_last_batch_exports_saved_text_without_requests(self):
+        state = self.make_state_for_route()
+        state["videos"][0]["transcript"] = "Already saved"
+        app.save_batch_state(state)
+
+        with patch("app.fetch_single_transcript") as fetch:
+            response = self.client.post("/download-last")
+        fetch.assert_not_called()
+        self.assertIn(b"Already saved", response.data)
+
     def test_successful_individual_transcript_download(self):
-        snippets = [SimpleNamespace(start=0, text="A transcript line.")]
-
-        class FakeApi:
-            def fetch(self, video_id, languages):
-                self.asserted_video_id = video_id
-                self.asserted_languages = languages
-                return snippets
-
-        fake_api = FakeApi()
-        with patch("app.YouTubeTranscriptApi", return_value=fake_api):
+        with patch(
+            "app.fetch_single_transcript",
+            return_value="A transcript line.",
+        ) as fetch:
             response = self.client.post(
                 "/",
                 data={
                     "urls": "https://youtu.be/abcdefghijk",
                     "languages": "en, es",
                     "timestamps": "on",
+                    "browser": "edge",
                 },
             )
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("attachment;", response.headers["Content-Disposition"])
         self.assertIn(b"A transcript line.", response.data)
-        self.assertIn(b"[00:00:00]", response.data)
-        self.assertEqual(fake_api.asserted_languages, ["en", "es"])
+        self.assertEqual(fetch.call_args.kwargs["browser"], "edge")
 
 
 if __name__ == "__main__":
