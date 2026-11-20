@@ -287,6 +287,7 @@ class BatchResumeTests(unittest.TestCase):
             side_effect=[
                 "Transcript one",
                 app.TranscriptBlocked("YouTube temporarily blocked this request."),
+                "Transcript two",
                 "Transcript three",
             ],
         ) as fetch:
@@ -307,10 +308,8 @@ class BatchResumeTests(unittest.TestCase):
             "complete", "complete", "complete"
         ])
         self.assertEqual(completed["videos"][0]["transcript"], "Transcript one")
-        self.assertEqual(
-            completed["videos"][1]["transcript"],
-            "Transcript three",
-        )
+        self.assertEqual(completed["videos"][1]["transcript"], "Transcript two")
+        self.assertEqual(completed["videos"][2]["transcript"], "Transcript three")
 
     def test_export_contains_success_no_caption_and_pending_sections(self):
         state = self.make_state()
