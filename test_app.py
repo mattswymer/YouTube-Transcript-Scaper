@@ -178,34 +178,13 @@ Second
 
 
 class TranscriptRetrievalTests(unittest.TestCase):
-    def test_ytdlp_retrieves_subtitles_without_downloading_video(self):
-        class FakeYoutubeDL:
-            options = None
-
-            def __init__(self, options):
-                FakeYoutubeDL.options = options
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def extract_info(self, url, download):
-                self.url = url
-                self.download = download
-                output_template = FakeYoutubeDL.options["outtmpl"]
-                vtt_path = Path(output_template.replace(
-                    "%(id)s.%(ext)s", "abcdefghijk.en.vtt"
-                ))
-                vtt_path.parent.mkdir(parents=True, exist_ok=True)
-                vtt_path.write_text(
-                    "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nA transcript line.\n",
-                    encoding="utf-8",
-                )
-                return {"requested_subtitles": {}}
-
-        with patch("app.YoutubeDL", FakeYoutubeDL):
+    def test_official_youtube_api_caption_is_formatted_into_transcript(self):
+        caption_file = (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:02.000\n"
+            "A transcript line.\n"
+        )
+        with patch("app.download_caption_file", return_value=caption_file) as api:
             transcript = app.fetch_single_transcript(
                 "abcdefghijk",
                 include_timestamps=True,
@@ -214,14 +193,7 @@ class TranscriptRetrievalTests(unittest.TestCase):
             )
 
         self.assertEqual(transcript, "[00:00:00]\nA transcript line.")
-        self.assertTrue(FakeYoutubeDL.options["skip_download"])
-        self.assertTrue(FakeYoutubeDL.options["writesubtitles"])
-        self.assertTrue(FakeYoutubeDL.options["writeautomaticsub"])
-        self.assertEqual(
-            FakeYoutubeDL.options["cookiesfrombrowser"],
-            ("edge", None, None, None),
-        )
-        self.assertNotIn("format", FakeYoutubeDL.options)
+        api.assert_called_once_with("abcdefghijk", languages=["en"])
 
     def test_blocked_download_message_suggests_local_browser_session(self):
         message = str(
@@ -340,6 +312,7 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"Load playlist videos", response.data)
         self.assertIn(b"Paste individual video links", response.data)
         self.assertIn(b"Chrome", response.data)
+        self.assertIn(b"YouTube account access", response.data)
 
     def test_rejects_more_than_ten_individual_links(self):
         response = self.client.post("/", data={"urls": "\n".join(["abcdefghijk"] * 11)})
@@ -394,7 +367,8 @@ class FlaskRouteTests(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_downloads_only_selected_playlist_videos_in_playlist_order(self):
-        with patch("app.start_batch_worker", return_value=True) as start_worker:
+        with patch("app.get_connection_status", return_value={"connected": True}), \
+             patch("app.start_batch_worker", return_value=True) as start_worker:
             response = self.client.post(
                 "/download-playlist",
                 data={
@@ -503,7 +477,8 @@ class FlaskRouteTests(unittest.TestCase):
         state = self.make_state_for_route()
         app.save_batch_state(state)
 
-        with patch("app.start_batch_worker", return_value=True) as start_worker:
+        with patch("app.get_connection_status", return_value={"connected": True}), \
+             patch("app.start_batch_worker", return_value=True) as start_worker:
             response = self.client.post(
                 "/resume-last",
                 data={"browser": "firefox"},
@@ -525,10 +500,11 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"Already saved", response.data)
 
     def test_successful_individual_transcript_download(self):
-        with patch(
-            "app.fetch_single_transcript",
-            return_value="A transcript line.",
-        ) as fetch:
+        with patch("app.get_connection_status", return_value={"connected": True}), \
+             patch(
+                "app.fetch_single_transcript",
+                return_value="A transcript line.",
+            ) as fetch:
             response = self.client.post(
                 "/",
                 data={
