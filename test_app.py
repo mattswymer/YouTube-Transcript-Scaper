@@ -180,7 +180,7 @@ class FlaskRouteTests(unittest.TestCase):
     def test_home_page_loads_with_playlist_and_individual_options(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"D&amp;D Session Transcript Scraper", response.data)
+        self.assertIn(b"D&D Session Transcript Scraper", response.data)
         self.assertIn(b"Load playlist videos", response.data)
         self.assertIn(b"Paste individual video links", response.data)
 
