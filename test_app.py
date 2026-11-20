@@ -394,40 +394,80 @@ class FlaskRouteTests(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_downloads_only_selected_playlist_videos_in_playlist_order(self):
-        with patch(
-            "app.fetch_single_transcript",
-            side_effect=lambda video_id, include_timestamps, languages, browser=None: (
-                f"Transcript for {video_id}"
-            ),
-        ):
-            with patch("app.time.sleep"):
-                response = self.client.post(
-                    "/download-playlist",
-                    data={
-                        "playlist_title": "Monday Campaign",
-                        "playlist_url": "https://www.youtube.com/playlist?list=PLabcdefghij",
-                        "languages": "en",
-                        "timestamps": "on",
-                        "playlist_video_ids": ["abcdefghijk", "lmnopqrstuv"],
-                        "selected_video_ids": ["lmnopqrstuv", "abcdefghijk"],
-                        "title__abcdefghijk": "Session One",
-                        "title__lmnopqrstuv": "Session Two",
-                        "duration__abcdefghijk": "01:00:00",
-                        "duration__lmnopqrstuv": "00:45:00",
-                    },
-                )
+        with patch("app.start_batch_worker", return_value=True) as start_worker:
+            response = self.client.post(
+                "/download-playlist",
+                data={
+                    "playlist_title": "Monday Campaign",
+                    "playlist_url": "https://www.youtube.com/playlist?list=PLabcdefghij",
+                    "languages": "en",
+                    "timestamps": "on",
+                    "playlist_video_ids": ["abcdefghijk", "lmnopqrstuv"],
+                    "selected_video_ids": ["lmnopqrstuv", "abcdefghijk"],
+                    "title__abcdefghijk": "Session One",
+                    "title__lmnopqrstuv": "Session Two",
+                    "duration__abcdefghijk": "01:00:00",
+                    "duration__lmnopqrstuv": "00:45:00",
+                },
+            )
 
-        self.assertEqual(response.status_code, 200)
-        content = response.get_data(as_text=True)
-        self.assertIn("Playlist: Monday Campaign", content)
-        self.assertIn("Session One", content)
-        self.assertIn("Session Two", content)
-        self.assertLess(content.index("Session One"), content.index("Session Two"))
-        self.assertEqual(response.mimetype, "text/plain")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/batch-progress"))
+        start_worker.assert_called_once_with(browser="")
         saved = app.load_batch_state()
         self.assertEqual([item["status"] for item in saved["videos"]], [
-            "complete", "complete"
+            "pending", "pending"
         ])
+        self.assertEqual([item["title"] for item in saved["videos"]], [
+            "Session One", "Session Two"
+        ])
+
+    def test_progress_page_has_separate_current_and_overall_bars(self):
+        state = {
+            "playlist_title": "Monday Campaign",
+            "is_processing": True,
+            "videos": [
+                {"video_id": "abcdefghijk", "title": "Session One", "status": "pending"},
+            ],
+        }
+        app.save_batch_state(state)
+
+        response = self.client.get("/batch-progress")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Current video", response.data)
+        self.assertIn(b"All selected videos", response.data)
+        self.assertIn(b"/api/batch-progress", response.data)
+
+    def test_progress_api_reports_file_and_batch_counts(self):
+        state = {
+            "playlist_title": "Monday Campaign",
+            "is_processing": True,
+            "current_video_index": 3,
+            "current_video_title": "Session Three",
+            "current_video_status": "Retrieving captions",
+            "current_video_progress": 45,
+            "videos": [
+                {"video_id": "abcdefghijk", "status": "complete"},
+                {"video_id": "lmnopqrstuv", "status": "no_transcript"},
+                {"video_id": "zyxwvutsrqp", "status": "pending"},
+                {"video_id": "zyxwvutsrqq", "status": "pending"},
+            ],
+        }
+        app.save_batch_state(state)
+
+        response = self.client.get("/api/batch-progress")
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["processing"])
+        self.assertEqual(data["total"], 4)
+        self.assertEqual(data["processed"], 2)
+        self.assertEqual(data["percent"], 50)
+        self.assertEqual(data["current_index"], 3)
+        self.assertEqual(data["current_title"], "Session Three")
+        self.assertEqual(data["current_progress"], 45)
+        self.assertEqual(data["successful"], 1)
+        self.assertEqual(data["no_transcript"], 1)
+        self.assertEqual(data["pending"], 2)
 
     def test_playlist_download_requires_a_selection(self):
         response = self.client.post(
@@ -459,24 +499,20 @@ class FlaskRouteTests(unittest.TestCase):
             "block_reason": "YouTube blocked the last request.",
         }
 
-    def test_resume_route_retries_only_pending_videos(self):
+    def test_resume_route_starts_worker_and_returns_to_progress_page(self):
         state = self.make_state_for_route()
         app.save_batch_state(state)
 
-        with patch(
-            "app.fetch_single_transcript",
-            return_value="Resumed transcript",
-        ) as fetch:
-            with patch("app.time.sleep"):
-                response = self.client.post(
-                    "/resume-last",
-                    data={"browser": "firefox"},
-                )
+        with patch("app.start_batch_worker", return_value=True) as start_worker:
+            response = self.client.post(
+                "/resume-last",
+                data={"browser": "firefox"},
+            )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(fetch.call_count, 1)
-        self.assertEqual(fetch.call_args.args[0], "lmnopqrstuv")
-        self.assertEqual(app.load_batch_state()["videos"][1]["status"], "complete")
+        self.assertEqual(response.status_code, 302)
+        self.assertTrue(response.headers["Location"].endswith("/batch-progress"))
+        start_worker.assert_called_once_with(browser="firefox")
+        self.assertEqual(app.load_batch_state()["videos"][1]["status"], "pending")
 
     def test_download_last_batch_exports_saved_text_without_requests(self):
         state = self.make_state_for_route()
