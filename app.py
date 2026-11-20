@@ -268,7 +268,7 @@ HTML_TEMPLATE = """
 
     <section class="section">
         <div class="section-heading">
-            <span class="step">OPTION 2</span>
+            <span class="step">OPTION 3</span>
             <h2>Paste individual video links</h2>
         </div>
         <form method="POST" action="/">
@@ -608,6 +608,14 @@ def create_transcript_response(video_items, include_timestamps, languages, playl
         url = f"https://www.youtube.com/watch?v={video_id}"
         title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:300]
 
+        if not video_id:
+            output_sections.append(
+                f"=== VIDEO {index}: INVALID YOUTUBE URL ===\n"
+                f"Input: {title}\n"
+                "[Error: Paste a valid YouTube video link or 11-character video ID.]\n"
+            )
+            continue
+
         try:
             body = fetch_single_transcript(api, video_id, include_timestamps, languages)
             if not body:
@@ -736,33 +744,9 @@ def index():
     video_items = []
     for url in urls:
         video_id = extract_video_id(url)
-        if video_id:
-            video_items.append({"video_id": video_id, "title": ""})
-        else:
-            video_items.append({"video_id": "", "title": url})
+        video_items.append({"video_id": video_id or "", "title": url})
 
-    # Keep invalid input visible in the output instead of attempting a transcript request.
-    valid_items = [item for item in video_items if item["video_id"]]
-    invalid_items = [item for item in video_items if not item["video_id"]]
-
-    response = create_transcript_response(valid_items, include_timestamps, languages)
-    if not invalid_items:
-        return response
-
-    # For mixed valid/invalid input, include invalid rows in the same text export.
-    # Generate the response body in memory so the combined file remains a single download.
-    body = response.get_data(as_text=True)
-    invalid_sections = [
-        f"=== INVALID YOUTUBE URL ===\nInput: {item['title']}\n"
-        "[Error: Paste a valid YouTube video link or 11-character video ID.]"
-        for item in invalid_items
-    ]
-    combined = body.rstrip() + "\n\n" + "\n\n".join(invalid_sections) + "\n"
-    return Response(
-        combined,
-        mimetype="text/plain; charset=utf-8",
-        headers=response.headers,
-    )
+    return create_transcript_response(video_items, include_timestamps, languages)
 
 
 @app.route("/load-playlist", methods=["POST"])
