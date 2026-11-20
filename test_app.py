@@ -93,12 +93,22 @@ class FlaskRouteTests(unittest.TestCase):
     def test_home_page_loads(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"D&amp;D Session Transcript Scraper", response.data)
+        self.assertIn(b"D&D Session Transcript Scraper", response.data)
 
     def test_rejects_more_than_ten_links(self):
         response = self.client.post("/", data={"urls": "\n".join(["abcdefghijk"] * 11)})
         self.assertEqual(response.status_code, 400)
         self.assertIn(b"limit each batch to 10", response.data)
+
+    def test_rejects_invalid_language_codes_without_requesting_youtube(self):
+        with patch("app.YouTubeTranscriptApi") as api_class:
+            response = self.client.post(
+                "/",
+                data={"urls": "https://youtu.be/abcdefghijk", "languages": "not_a_language"},
+            )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn(b"Language codes should look like", response.data)
+        api_class.assert_not_called()
 
     def test_invalid_url_is_explained_in_download(self):
         response = self.client.post("/", data={"urls": "https://example.com/not-a-video"})
@@ -117,15 +127,14 @@ class FlaskRouteTests(unittest.TestCase):
 
         fake_api = FakeApi()
         with patch("app.YouTubeTranscriptApi", return_value=fake_api):
-            with patch("app.time.sleep"):
-                response = self.client.post(
-                    "/",
-                    data={
-                        "urls": "https://youtu.be/abcdefghijk",
-                        "languages": "en, es",
-                        "timestamps": "on",
-                    },
-                )
+            response = self.client.post(
+                "/",
+                data={
+                    "urls": "https://youtu.be/abcdefghijk",
+                    "languages": "en, es",
+                    "timestamps": "on",
+                },
+            )
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("attachment;", response.headers["Content-Disposition"])
