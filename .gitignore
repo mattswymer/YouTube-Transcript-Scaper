@@ -2,3 +2,7 @@
 __pycache__/
 *.py[cod]
 data/
+
+# Local Google OAuth credentials and tokens
+client_secret.json
+client_secret_*.json
