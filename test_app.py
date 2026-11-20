@@ -180,9 +180,9 @@ Second
 class TranscriptRetrievalTests(unittest.TestCase):
     def test_official_youtube_api_caption_is_formatted_into_transcript(self):
         caption_file = (
-            "WEBVTT\\n\\n"
-            "00:00:00.000 --> 00:00:02.000\\n"
-            "A transcript line.\\n"
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:02.000\n"
+            "A transcript line.\n"
         )
         with patch("app.download_caption_file", return_value=caption_file) as api:
             transcript = app.fetch_single_transcript(
@@ -192,7 +192,7 @@ class TranscriptRetrievalTests(unittest.TestCase):
                 browser="edge",
             )
 
-        self.assertEqual(transcript, "[00:00:00]\\nA transcript line.")
+        self.assertEqual(transcript, "[00:00:00]\nA transcript line.")
         api.assert_called_once_with("abcdefghijk", languages=["en"])
 
     def test_blocked_download_message_suggests_local_browser_session(self):
