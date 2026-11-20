@@ -757,6 +757,15 @@ def load_playlist():
     raw_languages = request.form.get("languages", "en")
     include_timestamps = "timestamps" in request.form
 
+    if not extract_playlist_id(playlist_url):
+        return render_page(
+            "Paste a valid YouTube playlist link containing a playlist ID.",
+            languages=raw_languages,
+            include_timestamps=include_timestamps,
+            playlist_url=playlist_url,
+            status=400,
+        )
+
     try:
         languages = parse_languages(raw_languages)
         playlist = fetch_playlist_entries(playlist_url)
