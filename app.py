@@ -252,7 +252,7 @@ HTML_TEMPLATE = """
             <div class="video-list" id="videoList">
                 {% for video in playlist_entries %}
                 <label class="video-row" data-search="{{ (video.title ~ ' ' ~ video.video_id)|lower }}">
-                    <input class="video-checkbox" type="checkbox" name="selected_video_ids" value="{{ video.video_id }}">
+                    <input class="video-checkbox" type="checkbox" name="selected_video_ids" value="{{ video.video_id }}" {% if video.video_id in selected_ids %}checked{% endif %}>
                     <span class="video-index">{{ video.playlist_index }}</span>
                     <span class="video-title">{{ video.title }}</span>
                     <span class="video-duration">{{ video.duration_display }}</span>
@@ -353,6 +353,7 @@ def render_page(
     playlist_title="",
     playlist_url="",
     playlist_warning="",
+    selected_ids=None,
 ):
     page = render_template_string(
         HTML_TEMPLATE,
@@ -364,6 +365,7 @@ def render_page(
         playlist_title=playlist_title,
         playlist_url=playlist_url,
         playlist_warning=playlist_warning,
+        selected_ids=set(selected_ids or []),
     )
     return page, status
 
@@ -816,6 +818,7 @@ def download_playlist():
             playlist_entries=playlist_entries,
             playlist_title=playlist_title,
             playlist_url=playlist_url,
+            selected_ids=selected_ids,
             status=400,
         )
 
@@ -827,6 +830,7 @@ def download_playlist():
             playlist_entries=playlist_entries,
             playlist_title=playlist_title,
             playlist_url=playlist_url,
+            selected_ids=selected_ids,
             status=400,
         )
 
