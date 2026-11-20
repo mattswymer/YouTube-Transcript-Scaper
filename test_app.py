@@ -38,6 +38,7 @@ class PlaylistUrlTests(unittest.TestCase):
     def test_extracts_playlist_id_from_playlist_and_watch_urls(self):
         cases = [
             ("https://www.youtube.com/playlist?list=PLabcdefghij", "PLabcdefghij"),
+            ("https://www.youtube.com/playlist?list=WL", "WL"),
             (
                 "https://www.youtube.com/watch?v=abcdefghijk&list=PLabcdefghij",
                 "PLabcdefghij",
@@ -222,7 +223,7 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"Monday Campaign", response.data)
         self.assertIn(b"Session One", response.data)
         self.assertIn(b"Session Two", response.data)
-        self.assertIn(b"Select all", response.data)
+        self.assertIn(b"Select visible", response.data)
 
     def test_rejects_invalid_playlist_before_extraction(self):
         with patch("app.fetch_playlist_entries") as fetch:
