@@ -24,15 +24,31 @@ To stop the app, close its command window or press **Ctrl+C** in that window.
 - Transcripts are retrieved sequentially and combined in playlist order.
 - During a download, a live progress page shows the current video's status and overall batch completion.
 
-## If YouTube blocks a batch
+## YouTube account setup
 
-The app now uses yt-dlp to retrieve caption files rather than the separate transcript API. It can use captions created by the uploader or automatically generated captions.
+Transcript retrieval uses the official YouTube Data API. This is the reliable path for videos you own or have permission to edit. The app can retrieve uploader-provided captions and automatically generated speech-recognition captions when YouTube exposes those tracks.
 
-You can optionally select **Chrome**, **Edge**, or **Firefox** as the browser session. Use this when you are signed in to YouTube in that browser and the videos are available to your account. The app reads the browser cookies locally for that run; it does not save or upload them. If yt-dlp cannot read a browser's cookie database, completely close that browser and try again.
+Complete this one-time setup:
 
-Every completed transcript is saved locally as the batch runs. The download screen shows a current-video status bar and an overall playlist progress bar. If YouTube blocks a request, the current and remaining videos stay pending. Return to the app home page and select **Resume remaining videos** after waiting, optionally choosing a signed-in browser session. Videos already completed or confirmed to have no captions are not requested again.
+1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create or select a project.
+2. Enable **YouTube Data API v3** for the project.
+3. Open **Google Auth Platform**. For a personal, single-account installation, choose **Personal** audience mode when creating the app. This limits authorization to the Google account that created the app, but avoids the seven-day test-token expiration and the unverified-app warning. Personal mode is a one-time choice for a new project.
+4. Under **Data Access**, make sure the YouTube scope `https://www.googleapis.com/auth/youtube.force-ssl` is available.
+5. Create an OAuth client with application type **Desktop app** and download its JSON file.
+6. Rename the downloaded file to **client_secret.json** and place it in the same folder as **run.bat**.
+7. Start the app and click **Connect YouTube account**. Sign in with the Google account that owns the videos, or has permission to edit them.
 
-The last batch and its downloaded transcript text are kept in the local **data** folder so it can be resumed after closing the app. Use **Clear saved batch** on the home page to remove it. The data folder is excluded from Git.
+The app saves its refreshable authorization token in **data/youtube_token.json**. Both the token and OAuth client JSON stay on your computer; neither belongs in GitHub or in a shared ZIP. The app uses the OAuth scope Google requires for caption retrieval. That scope is broader than the app's read-only behavior and can permit editing or deleting YouTube content at the Google API permission level; this app only calls the caption-list and caption-download methods.
+
+If you configure the project as an **External** app and leave its publishing status at **Testing**, Google expires the authorization after seven days for this YouTube scope. You will need to reconnect periodically. Personal mode is the simpler choice when the same Google account will always use the app.
+
+## Caption retrieval, quota, and resume
+
+- The app calls `captions.list` to find the available tracks, prefers a standard track, and uses an `ASR` automatically generated track when that is the available match.
+- It calls `captions.download` for one selected language track and converts the returned WebVTT into the existing combined text export.
+- The current documented quota costs are 50 units for `captions.list` and 200 units for `captions.download`, or about **250 units per video** when one track is downloaded. With the default 10,000-unit daily allowance, that is approximately **40 videos per day**.
+- If the daily quota is exhausted, the batch pauses. Every completed transcript remains saved locally; use **Resume remaining videos** after the quota resets. Completed videos are not requested again.
+- No video or audio is downloaded.
 
 ## Individual video links
 
@@ -42,7 +58,7 @@ The individual-link workflow remains available. Paste up to 10 YouTube links, on
 
 - **Languages:** Enter language codes in preference order, separated by commas (for example, en, es). English is the default.
 - **Timestamps:** Include a timestamp approximately every 60 seconds in each transcript.
-- **Browser session:** Optional Chrome, Edge, or Firefox cookies. This is useful for videos that require your own YouTube account access.
+- **Playlist browser session:** Optional Chrome, Edge, or Firefox cookies for loading private playlist metadata. Caption retrieval itself uses the connected Google account.
 
 ## Manual setup
 
@@ -85,7 +101,7 @@ python -m unittest discover -v
 
 ## Important notes
 
-- A video needs captions or an available transcript. If YouTube has no caption track, the app cannot create a verbatim transcript.
+- A video needs a caption track that the connected Google account can access. If YouTube has no caption track, the app cannot create a verbatim transcript.
 - Unlisted playlists and videos are supported when YouTube makes their data/captions available.
-- YouTube may still limit requests, even with slower downloads or browser cookies. The saved-batch/resume feature is designed to avoid losing work when that happens.
+- The YouTube Data API enforces daily quota. The saved-batch/resume feature is designed to pause cleanly when the quota is exhausted without losing completed transcripts.
 - This is a local app. It listens only on your computer (127.0.0.1); it is not a public website.
