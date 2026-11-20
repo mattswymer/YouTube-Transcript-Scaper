@@ -243,7 +243,7 @@ HTML_TEMPLATE = """
                     <label for="videoSearch">Filter videos</label>
                     <input id="videoSearch" type="search" placeholder="Search titles or video IDs">
                 </div>
-                <button type="button" class="secondary" id="selectAll">Select all</button>
+                <button type="button" class="secondary" id="selectAll">Select visible</button>
                 <button type="button" class="secondary" id="clearAll">Clear selection</button>
             </div>
 
@@ -457,7 +457,7 @@ def extract_playlist_id(value: str):
         return None
 
     playlist_id = parse_qs(parsed.query).get("list", [None])[0]
-    if not playlist_id or not re.fullmatch(r"[A-Za-z0-9_-]{10,128}", playlist_id):
+    if not playlist_id or not re.fullmatch(r"[A-Za-z0-9_-]{2,128}", playlist_id):
         return None
 
     return playlist_id
