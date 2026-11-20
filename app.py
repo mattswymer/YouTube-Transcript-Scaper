@@ -14,6 +14,17 @@ from flask import Flask, Response, jsonify, render_template_string, request, red
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
+from youtube_api import (
+    CaptionTrackUnavailable,
+    YouTubeApiAuthenticationRequired,
+    YouTubeApiError,
+    YouTubeApiPermissionDenied,
+    YouTubeApiQuotaExceeded,
+    connect_youtube_account,
+    download_caption_file,
+    get_connection_status,
+)
+
 app = Flask(__name__)
 
 MAX_VIDEOS = 10
@@ -180,6 +191,28 @@ HTML_TEMPLATE = """
         Everything is combined into one downloadable text file.
     </p>
 
+    <section class="section">
+        <div class="section-heading">
+            <span class="step">YOUTUBE API</span>
+            <h2>YouTube account access</h2>
+        </div>
+        {% if youtube_status.connected %}
+        <p class="selection-summary">Connected. Captions are retrieved through the official YouTube Data API.</p>
+        {% else %}
+            {% if not youtube_status.configured %}
+            <div class="note">
+                <strong>One-time setup:</strong> In Google Cloud, enable YouTube Data API v3 and create an OAuth client with application type <strong>Desktop app</strong>. Save the downloaded JSON file beside run.bat as <code>client_secret.json</code>, then reload this page.
+            </div>
+            {% else %}
+            <div class="warning">{{ youtube_status.message }}</div>
+            {% endif %}
+            <form method="POST" action="/connect-youtube">
+                <button type="submit" {% if not youtube_status.configured %}disabled{% endif %}>Connect YouTube account</button>
+            </form>
+        {% endif %}
+        <p class="help">Use the Google account that owns the videos or has permission to edit them. The authorization token stays in this app's local data folder.</p>
+    </section>
+
     {% if error %}
     <div class="error" role="alert">{{ error }}</div>
     {% endif %}
@@ -250,7 +283,7 @@ HTML_TEMPLATE = """
                     <option value="edge" {% if browser == "edge" %}selected{% endif %}>Microsoft Edge</option>
                     <option value="firefox" {% if browser == "firefox" %}selected{% endif %}>Firefox</option>
                 </select>
-                <p class="help">Use a browser where you are signed in to YouTube. Cookies are read locally and are not saved.</p>
+                <p class="help">Optional: use a signed-in browser session when loading private playlist metadata. Caption downloads use the connected Google account.</p>
             </div>
 
             <div class="controls">
@@ -334,16 +367,6 @@ HTML_TEMPLATE = """
                        value="{{ languages }}" placeholder="en, es">
             </div>
 
-            <div class="field">
-                <label for="single_browser">YouTube browser session (optional)</label>
-                <select id="single_browser" name="browser">
-                    <option value="">No browser cookies</option>
-                    <option value="chrome" {% if browser == "chrome" %}selected{% endif %}>Chrome</option>
-                    <option value="edge" {% if browser == "edge" %}selected{% endif %}>Microsoft Edge</option>
-                    <option value="firefox" {% if browser == "firefox" %}selected{% endif %}>Firefox</option>
-                </select>
-            </div>
-
             <div class="controls">
                 <label class="checkbox-label">
                     <input type="checkbox" name="timestamps" {% if include_timestamps %}checked{% endif %}>
@@ -356,9 +379,7 @@ HTML_TEMPLATE = """
     </section>
 
     <div class="note">
-        <strong>Notes:</strong> Public and unlisted playlists can be read when YouTube makes their playlist data available.
-        Private playlists and private videos require a signed-in browser session. A video must have captions or an available transcript.
-        If YouTube blocks a batch, progress is saved and the remaining videos can be resumed later.
+        <strong>Notes:</strong> The app retrieves uploader-provided or automatically generated caption tracks through YouTube's official API. The connected Google account must have permission to edit each video. Playlist metadata can still use a local browser session when needed. If the API daily quota is reached, progress is saved and the remaining videos can be resumed after the quota resets.
     </div>
 
     <script>
@@ -639,9 +660,12 @@ def render_page(
     selected_ids=None,
     browser="",
     batch_summary=None,
+    youtube_status=None,
 ):
     if batch_summary is None:
         batch_summary = get_batch_summary()
+    if youtube_status is None:
+        youtube_status = get_connection_status()
 
     page = render_template_string(
         HTML_TEMPLATE,
@@ -656,6 +680,7 @@ def render_page(
         selected_ids=set(selected_ids or []),
         browser=browser if browser in SUPPORTED_BROWSER_CHOICES else "",
         batch_summary=batch_summary,
+        youtube_status=youtube_status,
     )
     return page, status
 
@@ -1033,84 +1058,27 @@ def fetch_single_transcript(
     languages=None,
     browser=None,
 ) -> str:
-    """Retrieve caption files through yt-dlp without downloading video/audio."""
-    requested_languages = languages or ["en"]
-    language_patterns = [f"{re.escape(language)}.*" for language in requested_languages]
+    """Retrieve one caption track through the official YouTube Data API."""
+    try:
+        caption_file = download_caption_file(
+            video_id,
+            languages=languages or ["en"],
+        )
+    except YouTubeApiAuthenticationRequired as exc:
+        raise TranscriptBlocked(str(exc)) from exc
+    except YouTubeApiQuotaExceeded as exc:
+        raise TranscriptBlocked(str(exc)) from exc
+    except CaptionTrackUnavailable as exc:
+        raise NoTranscriptAvailable(str(exc)) from exc
+    except YouTubeApiPermissionDenied as exc:
+        raise TranscriptUnavailable(str(exc)) from exc
+    except YouTubeApiError as exc:
+        raise TranscriptUnavailable(str(exc)) from exc
 
-    with tempfile.TemporaryDirectory(prefix="youtube-transcript-") as temp_dir:
-        output_template = os.path.join(temp_dir, "%(id)s.%(ext)s")
-        options = {
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
-            "skip_download": True,
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitleslangs": language_patterns,
-            "subtitlesformat": "vtt/best",
-            "outtmpl": output_template,
-            "socket_timeout": 30,
-            "retries": 2,
-            "extractor_retries": 1,
-            "sleep_interval_requests": 1.0,
-            "sleep_interval_subtitles": SUBTITLE_REQUEST_SLEEP_SECONDS,
-            "noplaylist": True,
-        }
-        apply_browser_cookies(options, browser)
-
-        try:
-            with YoutubeDL(options) as ydl:
-                info = ydl.extract_info(
-                    f"https://www.youtube.com/watch?v={video_id}",
-                    download=True,
-                )
-        except DownloadError as exc:
-            raise classify_ytdlp_error(exc) from exc
-
-        candidates = []
-        requested_subtitles = (info or {}).get("requested_subtitles") or {}
-
-        for language in requested_languages:
-            for code, subtitle in requested_subtitles.items():
-                if code.lower() == language.lower() or code.lower().startswith(language.lower() + "-"):
-                    filepath = subtitle.get("filepath")
-                    if filepath and os.path.isfile(filepath):
-                        candidates.append(Path(filepath))
-                    elif subtitle.get("data"):
-                        return parse_subtitle_file(
-                            subtitle["data"], include_timestamps=include_timestamps
-                        )
-
-        files = list(Path(temp_dir).rglob("*.vtt")) + list(Path(temp_dir).rglob("*.srt"))
-        for language in requested_languages:
-            preferred = [
-                path for path in files
-                if path.stem.split(".")[-1].lower() == language.lower()
-                or path.stem.split(".")[-1].lower().startswith(language.lower() + "-")
-            ]
-            for path in preferred:
-                if path not in candidates:
-                    candidates.append(path)
-
-        for path in files:
-            if path not in candidates:
-                candidates.append(path)
-
-        if not candidates:
-            raise NoTranscriptAvailable(
-                "No subtitles or automatically generated captions are available "
-                "in the requested language(s)."
-            )
-
-        for path in candidates:
-            try:
-                content = path.read_text(encoding="utf-8-sig")
-                return parse_subtitle_file(content, include_timestamps=include_timestamps)
-            except (OSError, UnicodeError, NoTranscriptAvailable):
-                continue
-
-        raise NoTranscriptAvailable("No readable subtitles were returned for this video.")
-
+    return parse_subtitle_file(
+        caption_file,
+        include_timestamps=include_timestamps,
+    )
 
 def describe_transcript_error(exc: Exception) -> str:
     if isinstance(exc, TranscriptBlocked):
@@ -1118,6 +1086,8 @@ def describe_transcript_error(exc: Exception) -> str:
     if isinstance(exc, NoTranscriptAvailable):
         return "Captions and transcripts are disabled or unavailable in the requested language(s)."
     if isinstance(exc, TranscriptUnavailable):
+        return str(exc)
+    if isinstance(exc, YouTubeApiError):
         return str(exc)
     if isinstance(exc, DownloadError):
         return str(classify_ytdlp_error(exc))
@@ -1466,6 +1436,20 @@ def start_batch_worker(browser=None):
         raise
 
 
+@app.route("/connect-youtube", methods=["POST"])
+def connect_youtube():
+    try:
+        connect_youtube_account()
+    except YouTubeApiError as exc:
+        return render_page(str(exc), status=400)
+    except Exception as exc:
+        return render_page(
+            f"Google authorization failed ({type(exc).__name__}). Check your OAuth Desktop client setup and try again.",
+            status=400,
+        )
+    return render_page()
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
     if request.method == "GET":
@@ -1500,6 +1484,16 @@ def index():
         languages = parse_languages(raw_languages)
     except ValueError as exc:
         return render_page(str(exc), raw_urls, raw_languages, include_timestamps, 400)
+
+    connection = get_connection_status()
+    if not connection["connected"]:
+        return render_page(
+            connection["message"] + " Connect your YouTube account before downloading transcripts.",
+            raw_urls,
+            raw_languages,
+            include_timestamps,
+            400,
+        )
 
     video_items = []
     for url in urls:
@@ -1609,6 +1603,19 @@ def download_playlist():
             status=400,
         )
 
+    connection = get_connection_status()
+    if not connection["connected"]:
+        return render_page(
+            connection["message"] + " Connect your YouTube account before downloading transcripts.",
+            languages=raw_languages,
+            include_timestamps=include_timestamps,
+            playlist_entries=playlist_entries,
+            playlist_title=playlist_title,
+            playlist_url=playlist_url,
+            selected_ids=selected_ids,
+            status=400,
+        )
+
     try:
         languages = parse_languages(raw_languages)
     except ValueError as exc:
@@ -1656,6 +1663,13 @@ def resume_last_batch():
     state = load_batch_state()
     if not state:
         return render_page("There is no saved batch to resume.", status=400)
+
+    connection = get_connection_status()
+    if not connection["connected"]:
+        return render_page(
+            connection["message"] + " Connect your YouTube account before resuming this batch.",
+            status=400,
+        )
 
     browser = normalize_browser(request.form.get("browser", state.get("browser", "")))
     state["browser"] = browser
