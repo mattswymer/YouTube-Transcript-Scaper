@@ -19,7 +19,7 @@ To stop the app, close its command window or press **Ctrl+C** in that window.
 - Paste a standard YouTube playlist URL, including a playlist ID in the URL.
 - The app reads the playlist title and video list without downloading video files.
 - Search the titles or video IDs to narrow the list.
-- Use **Select all** to select all currently visible search results, or **Clear selection** to uncheck everything.
+- Use **Select visible** to select all currently visible search results, or **Clear selection** to uncheck everything.
 - Select up to **200 videos per transcript batch**. Playlists can contain up to 500 entries in the selector; larger playlists are limited to the first 500 entries.
 - The app retrieves transcripts sequentially and combines them in playlist order. If YouTube temporarily blocks transcript requests, it stops the batch and marks the remaining videos as skipped.
 
