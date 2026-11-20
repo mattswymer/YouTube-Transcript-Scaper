@@ -53,7 +53,7 @@ class PlaylistUrlTests(unittest.TestCase):
         cases = [
             "",
             "https://example.com/playlist?list=PLabcdefghij",
-            "https://youtube.com/playlist?list=short",
+            "https://youtube.com/playlist?list=s",
             "https://youtube.com/watch?v=abcdefghijk",
             "https://youtube.com.evil.example/playlist?list=PLabcdefghij",
         ]
