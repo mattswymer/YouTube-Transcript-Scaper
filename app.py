@@ -569,7 +569,7 @@ PROGRESS_TEMPLATE = """
         const unavailableCount = document.getElementById("unavailableCount");
         const failedCount = document.getElementById("failedCount");
         const blockNotice = document.getElementById("blockNotice");
-        const downloadButton = document.getElementById("downloadButton");
+        const downloadForm = document.getElementById("downloadForm");
         const resumeForm = document.getElementById("resumeForm");
 
         async function refreshProgress() {
@@ -604,7 +604,7 @@ PROGRESS_TEMPLATE = """
                 blockNotice.hidden = !data.block_reason;
                 blockNotice.textContent = data.block_reason || "";
 
-                downloadButton.hidden = data.processing || data.total === 0;
+                downloadForm.hidden = data.processing || data.total === 0;
                 resumeForm.hidden = data.processing || data.retryable === 0;
 
                 if (!data.processing && data.pending === 0) {
