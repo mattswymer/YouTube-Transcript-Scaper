@@ -22,6 +22,7 @@ To stop the app, close its command window or press **Ctrl+C** in that window.
 - Use **Select visible** to select all currently visible search results, or **Clear selection** to uncheck everything.
 - Select up to **200 videos per transcript batch**. Playlists can contain up to 500 entries in the selector; larger playlists are limited to the first 500 entries.
 - Transcripts are retrieved sequentially and combined in playlist order.
+- During a download, a live progress page shows the current video's status and overall batch completion.
 
 ## If YouTube blocks a batch
 
@@ -29,7 +30,7 @@ The app now uses yt-dlp to retrieve caption files rather than the separate trans
 
 You can optionally select **Chrome**, **Edge**, or **Firefox** as the browser session. Use this when you are signed in to YouTube in that browser and the videos are available to your account. The app reads the browser cookies locally for that run; it does not save or upload them. If yt-dlp cannot read a browser's cookie database, completely close that browser and try again.
 
-Every completed transcript is saved locally as the batch runs. If YouTube blocks a request, the current and remaining videos stay pending. Return to the app home page and select **Resume remaining videos** after waiting, optionally choosing a signed-in browser session. Videos already completed or confirmed to have no captions are not requested again.
+Every completed transcript is saved locally as the batch runs. The download screen shows a current-video status bar and an overall playlist progress bar. If YouTube blocks a request, the current and remaining videos stay pending. Return to the app home page and select **Resume remaining videos** after waiting, optionally choosing a signed-in browser session. Videos already completed or confirmed to have no captions are not requested again.
 
 The last batch and its downloaded transcript text are kept in the local **data** folder so it can be resumed after closing the app. Use **Clear saved batch** on the home page to remove it. The data folder is excluded from Git.
 
