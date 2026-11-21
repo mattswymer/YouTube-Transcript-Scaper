@@ -315,7 +315,7 @@ class FlaskRouteTests(unittest.TestCase):
             "app.create_authorization_request",
             return_value=(fake_flow, authorization_url, "state-123"),
         ) as start_auth:
-            response = self.client.post("/connect-youtube")
+            response = self.client.get("/connect-youtube")
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["Location"], authorization_url)
@@ -342,6 +342,7 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"Paste individual video links", response.data)
         self.assertIn(b"Chrome", response.data)
         self.assertIn(b"YouTube account access", response.data)
+        self.assertIn(b'href="/connect-youtube"', response.data)
 
     def test_rejects_more_than_ten_individual_links(self):
         response = self.client.post("/", data={"urls": "\n".join(["abcdefghijk"] * 11)})
