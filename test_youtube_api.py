@@ -142,6 +142,60 @@ class CaptionDownloadTests(unittest.TestCase):
 
 
 class OAuthStateTests(unittest.TestCase):
+    def test_authorization_request_returns_google_url_and_state(self):
+        class FakeFlow:
+            redirect_uri = None
+
+            def authorization_url(self, **kwargs):
+                self.authorization_args = kwargs
+                return "https://accounts.google.com/authorize?client=test", "state-123"
+
+        fake_flow = FakeFlow()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client_file = Path(temp_dir) / "client_secret.json"
+            client_file.write_text("{}", encoding="utf-8")
+            with patch("youtube_api.CLIENT_SECRET_PATH", client_file), patch(
+                "youtube_api.InstalledAppFlow.from_client_secrets_file",
+                return_value=fake_flow,
+            ) as from_file:
+                flow, authorization_url, state = youtube_api.create_authorization_request(
+                    "http://127.0.0.1:5000"
+                )
+
+        self.assertIs(flow, fake_flow)
+        self.assertEqual(authorization_url, "https://accounts.google.com/authorize?client=test")
+        self.assertEqual(state, "state-123")
+        self.assertEqual(fake_flow.redirect_uri, "http://127.0.0.1:5000")
+        self.assertEqual(fake_flow.authorization_args["access_type"], "offline")
+        self.assertEqual(fake_flow.authorization_args["prompt"], "consent")
+        from_file.assert_called_once_with(str(client_file), youtube_api.SCOPES)
+
+    def test_callback_checks_state_and_saves_credentials(self):
+        class FakeFlow:
+            credentials = object()
+
+            def fetch_token(self, **kwargs):
+                self.authorization_response = kwargs["authorization_response"]
+
+        fake_flow = FakeFlow()
+        callback = "http://127.0.0.1:5000/?code=abc&state=state-123"
+        with patch("youtube_api._save_credentials") as save:
+            credentials = youtube_api.complete_authorization(
+                fake_flow, "state-123", callback
+            )
+
+        self.assertIs(credentials, fake_flow.credentials)
+        self.assertEqual(fake_flow.authorization_response, callback)
+        save.assert_called_once_with(fake_flow.credentials)
+
+    def test_callback_rejects_wrong_state(self):
+        with self.assertRaises(youtube_api.YouTubeApiAuthenticationRequired):
+            youtube_api.complete_authorization(
+                object(),
+                "expected",
+                "http://127.0.0.1:5000/?code=abc&state=wrong",
+            )
+
     def test_missing_client_file_reports_setup_required(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             missing = Path(temp_dir) / "client_secret.json"
