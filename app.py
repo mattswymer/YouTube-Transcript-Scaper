@@ -123,6 +123,21 @@ HTML_TEMPLATE = """
         }
         button:hover { background: #6d28d9; }
         button:focus-visible { outline: 2px solid white; outline-offset: 3px; }
+        a.primary-link {
+            display: inline-block;
+            box-sizing: border-box;
+            background: #7c3aed;
+            color: white;
+            border: none;
+            padding: 11px 18px;
+            font-size: 15px;
+            font-weight: 600;
+            border-radius: 8px;
+            cursor: pointer;
+            text-decoration: none;
+        }
+        a.primary-link:hover { background: #6d28d9; }
+        a.primary-link:focus-visible { outline: 2px solid white; outline-offset: 3px; }
         button.secondary {
             background: #3f3f46;
             color: #f4f4f5;
@@ -210,9 +225,11 @@ HTML_TEMPLATE = """
             {% else %}
             <div class="warning">{{ youtube_status.message }}</div>
             {% endif %}
-            <form method="POST" action="/connect-youtube">
-                <button type="submit" {% if not youtube_status.configured %}disabled{% endif %}>Connect YouTube account</button>
-            </form>
+            {% if youtube_status.configured %}
+            <a class="primary-link" href="{{ url_for('connect_youtube') }}">Connect YouTube account</a>
+            {% else %}
+            <button type="button" disabled>Connect YouTube account</button>
+            {% endif %}
         {% endif %}
         <p class="help">Use the Google account that owns the videos or has permission to edit them. The authorization token stays in this app's local data folder.</p>
     </section>
@@ -1432,7 +1449,7 @@ def start_batch_worker(browser=None):
         raise
 
 
-@app.route("/connect-youtube", methods=["POST"])
+@app.route("/connect-youtube", methods=["GET", "POST"])
 def connect_youtube():
     global OAUTH_FLOW, OAUTH_STATE
     try:
@@ -1442,7 +1459,7 @@ def connect_youtube():
         with OAUTH_LOCK:
             OAUTH_FLOW = flow
             OAUTH_STATE = state
-        # Navigate this tab to Google; no popup or Python-launched browser is required.
+        # Navigate this tab to Google; no form submission or popup is required.
         return redirect(authorization_url)
     except YouTubeApiError as exc:
         return render_page(str(exc), status=400)
