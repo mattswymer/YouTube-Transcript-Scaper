@@ -335,7 +335,15 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIsNone(app.OAUTH_STATE)
 
     def test_home_page_loads_with_playlist_and_individual_options(self):
-        response = self.client.get("/")
+        with patch(
+            "app.get_connection_status",
+            return_value={
+                "configured": True,
+                "connected": False,
+                "message": "Not connected",
+            },
+        ):
+            response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"D&D Session Transcript Scraper", response.data)
         self.assertIn(b"Load playlist videos", response.data)
