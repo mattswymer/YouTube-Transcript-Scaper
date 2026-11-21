@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -82,32 +83,69 @@ def get_credentials(interactive: bool = False) -> Credentials:
             "Connect your YouTube account from the app home page before retrieving captions."
         )
 
+    raise YouTubeApiAuthenticationRequired(
+        "Google authorization must be started from the app home page."
+    )
+
+
+def create_authorization_request(redirect_uri: str):
+    """Create a Google consent URL that returns to this app's loopback address."""
+    if not CLIENT_SECRET_PATH.is_file():
+        raise YouTubeApiAuthenticationRequired(
+            "Google OAuth setup is incomplete. Place your downloaded Desktop OAuth "
+            "JSON file beside run.bat and name it client_secret.json."
+        )
+
     try:
         flow = InstalledAppFlow.from_client_secrets_file(
             str(CLIENT_SECRET_PATH), SCOPES
         )
-        credentials = flow.run_local_server(
-            host="127.0.0.1",
-            port=0,
-            open_browser=True,
+        # Desktop OAuth clients use a loopback IP redirect URI with no path.
+        flow.redirect_uri = redirect_uri
+        authorization_url, state = flow.authorization_url(
             access_type="offline",
             prompt="consent",
-            authorization_prompt_message=(
-                "Your browser will open so you can authorize this local transcript app."
-            ),
-            success_message=(
-                "YouTube authorization succeeded. You can close this tab and return "
-                "to the transcript app."
-            ),
         )
+        return flow, authorization_url, state
+    except YouTubeApiError:
+        raise
     except Exception as exc:
         raise YouTubeApiAuthenticationRequired(
-            "Google authorization did not complete. Check the OAuth Desktop client "
-            "file and try Connect YouTube account again."
+            "Google authorization could not be started. Check your OAuth Desktop "
+            "client setup and try again."
         ) from exc
 
-    _save_credentials(credentials)
-    return credentials
+
+def complete_authorization(flow, expected_state: str, authorization_response: str):
+    """Validate Google's callback, exchange its code, and save the local token."""
+    params = parse_qs(urlparse(authorization_response).query)
+    provider_error = params.get("error", [""])[0]
+    if provider_error:
+        message = (
+            "Google authorization was cancelled."
+            if provider_error == "access_denied"
+            else f"Google authorization failed ({provider_error})."
+        )
+        raise YouTubeApiAuthenticationRequired(message)
+
+    returned_state = params.get("state", [""])[0]
+    if not expected_state or returned_state != expected_state:
+        raise YouTubeApiAuthenticationRequired(
+            "Google authorization could not be verified. Please connect again."
+        )
+
+    try:
+        flow.fetch_token(authorization_response=authorization_response)
+        credentials = flow.credentials
+        _save_credentials(credentials)
+        return credentials
+    except YouTubeApiError:
+        raise
+    except Exception as exc:
+        raise YouTubeApiAuthenticationRequired(
+            "Google did not complete authorization. Check the OAuth Desktop client "
+            "configuration and try connecting again."
+        ) from exc
 
 
 def get_youtube_service(interactive: bool = False):
