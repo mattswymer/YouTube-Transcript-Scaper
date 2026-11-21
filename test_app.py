@@ -305,6 +305,35 @@ class FlaskRouteTests(unittest.TestCase):
         self.path_patcher.stop()
         self.temp_dir.cleanup()
 
+    def test_connect_youtube_redirects_to_google_and_callback_saves_token(self):
+        fake_flow = object()
+        authorization_url = "https://accounts.google.com/authorize?client=test"
+        app.OAUTH_FLOW = None
+        app.OAUTH_STATE = None
+
+        with patch(
+            "app.create_authorization_request",
+            return_value=(fake_flow, authorization_url, "state-123"),
+        ) as start_auth:
+            response = self.client.post("/connect-youtube")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], authorization_url)
+        start_auth.assert_called_once()
+
+        with patch("app.complete_authorization") as finish_auth:
+            callback = self.client.get("/?code=auth-code&state=state-123")
+
+        self.assertEqual(callback.status_code, 302)
+        self.assertEqual(callback.headers["Location"], "/")
+        finish_auth.assert_called_once_with(
+            fake_flow,
+            "state-123",
+            "http://localhost/?code=auth-code&state=state-123",
+        )
+        self.assertIsNone(app.OAUTH_FLOW)
+        self.assertIsNone(app.OAUTH_STATE)
+
     def test_home_page_loads_with_playlist_and_individual_options(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
