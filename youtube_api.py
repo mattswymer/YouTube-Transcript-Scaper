@@ -184,15 +184,43 @@ def get_connection_status() -> dict:
     }
 
 
-def _api_error_reason(exc: HttpError) -> str:
+def _api_error_details(exc: HttpError) -> tuple[str, str]:
+    """Return Google's machine-readable reason and human-readable message."""
     try:
         payload = json.loads(exc.content.decode("utf-8"))
-        errors = payload.get("error", {}).get("errors", [])
-        if errors:
-            return str(errors[0].get("reason") or "")
-        return str(payload.get("error", {}).get("status") or "")
+        error = payload.get("error", {})
+        errors = error.get("errors", [])
+        reason = str(errors[0].get("reason") or "") if errors else str(error.get("status") or "")
+        return reason, str(error.get("message") or "")
     except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, TypeError):
-        return ""
+        return "", ""
+
+
+def _api_error_reason(exc: HttpError) -> str:
+    return _api_error_details(exc)[0]
+
+
+def _log_api_error(operation: str, video_id: str, exc: HttpError) -> None:
+    status = getattr(exc.resp, "status", None)
+    reason, message = _api_error_details(exc)
+    print(
+        f"[YouTube API DEBUG] {operation} failed for video {video_id}: "
+        f"HTTP {status}; reason={reason or 'unknown'}; message={message or str(exc)}",
+        flush=True,
+    )
+
+
+def get_authenticated_channel() -> list[dict[str, str]]:
+    """Return the channel(s) Google associates with the saved OAuth account."""
+    youtube = get_youtube_service(interactive=False)
+    response = youtube.channels().list(part="snippet", mine=True).execute()
+    return [
+        {
+            "id": str(item.get("id") or ""),
+            "title": str((item.get("snippet") or {}).get("title") or ""),
+        }
+        for item in response.get("items", [])
+    ]
 
 
 def _raise_api_error(exc: HttpError) -> None:
@@ -279,26 +307,47 @@ def choose_caption_track(tracks: list[dict], languages: list[str]) -> dict | Non
     return None
 
 
+_CHANNEL_DIAGNOSTIC_DONE = False
+
+
 def download_caption_file(
     video_id: str,
     languages: list[str] | None = None,
     service=None,
 ) -> str:
     """List and download one preferred caption track as WebVTT, without media."""
+    global _CHANNEL_DIAGNOSTIC_DONE
     youtube = service or get_youtube_service(interactive=False)
     requested_languages = languages or ["en"]
+
+    if not _CHANNEL_DIAGNOSTIC_DONE and service is None:
+        try:
+            channels = get_authenticated_channel()
+            print(
+                "[YouTube API DEBUG] Authenticated channel(s): "
+                + (", ".join(f"{c['title']} [{c['id']}]" for c in channels) or "none returned"),
+                flush=True,
+            )
+        except HttpError as exc:
+            _log_api_error("channels.list(mine=true)", video_id, exc)
+        _CHANNEL_DIAGNOSTIC_DONE = True
 
     try:
         response = youtube.captions().list(
             part="snippet",
             videoId=video_id,
         ).execute()
-        track = choose_caption_track(response.get("items", []), requested_languages)
-        if not track:
-            raise CaptionTrackUnavailable(
-                "No usable caption track was found in the requested language(s)."
-            )
+    except HttpError as exc:
+        _log_api_error("captions.list", video_id, exc)
+        _raise_api_error(exc)
 
+    track = choose_caption_track(response.get("items", []), requested_languages)
+    if not track:
+        raise CaptionTrackUnavailable(
+            "No usable caption track was found in the requested language(s)."
+        )
+
+    try:
         request = youtube.captions().download(
             id=track["id"],
             tfmt="vtt",
@@ -308,12 +357,13 @@ def download_caption_file(
         done = False
         while not done:
             _, done = downloader.next_chunk()
-
-        content = output.getvalue().decode("utf-8-sig", errors="replace")
-        if not content.strip():
-            raise CaptionTrackUnavailable(
-                "YouTube returned an empty caption file for this video."
-            )
-        return content
     except HttpError as exc:
+        _log_api_error("captions.download", video_id, exc)
         _raise_api_error(exc)
+
+    content = output.getvalue().decode("utf-8-sig", errors="replace")
+    if not content.strip():
+        raise CaptionTrackUnavailable(
+            "YouTube returned an empty caption file for this video."
+        )
+    return content
