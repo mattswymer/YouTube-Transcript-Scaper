@@ -178,34 +178,13 @@ Second
 
 
 class TranscriptRetrievalTests(unittest.TestCase):
-    def test_ytdlp_retrieves_subtitles_without_downloading_video(self):
-        class FakeYoutubeDL:
-            options = None
-
-            def __init__(self, options):
-                FakeYoutubeDL.options = options
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def extract_info(self, url, download):
-                self.url = url
-                self.download = download
-                output_template = FakeYoutubeDL.options["outtmpl"]
-                vtt_path = Path(output_template.replace(
-                    "%(id)s.%(ext)s", "abcdefghijk.en.vtt"
-                ))
-                vtt_path.parent.mkdir(parents=True, exist_ok=True)
-                vtt_path.write_text(
-                    "WEBVTT\n\n00:00:00.000 --> 00:00:02.000\nA transcript line.\n",
-                    encoding="utf-8",
-                )
-                return {"requested_subtitles": {}}
-
-        with patch("app.YoutubeDL", FakeYoutubeDL):
+    def test_official_youtube_api_caption_is_formatted_into_transcript(self):
+        caption_file = (
+            "WEBVTT\n\n"
+            "00:00:00.000 --> 00:00:02.000\n"
+            "A transcript line.\n"
+        )
+        with patch("app.download_caption_file", return_value=caption_file) as api:
             transcript = app.fetch_single_transcript(
                 "abcdefghijk",
                 include_timestamps=True,
@@ -214,14 +193,7 @@ class TranscriptRetrievalTests(unittest.TestCase):
             )
 
         self.assertEqual(transcript, "[00:00:00]\nA transcript line.")
-        self.assertTrue(FakeYoutubeDL.options["skip_download"])
-        self.assertTrue(FakeYoutubeDL.options["writesubtitles"])
-        self.assertTrue(FakeYoutubeDL.options["writeautomaticsub"])
-        self.assertEqual(
-            FakeYoutubeDL.options["cookiesfrombrowser"],
-            ("edge", None, None, None),
-        )
-        self.assertNotIn("format", FakeYoutubeDL.options)
+        api.assert_called_once_with("abcdefghijk", languages=["en"])
 
     def test_blocked_download_message_suggests_local_browser_session(self):
         message = str(
@@ -333,13 +305,52 @@ class FlaskRouteTests(unittest.TestCase):
         self.path_patcher.stop()
         self.temp_dir.cleanup()
 
+    def test_connect_youtube_redirects_to_google_and_callback_saves_token(self):
+        fake_flow = object()
+        authorization_url = "https://accounts.google.com/authorize?client=test"
+        app.OAUTH_FLOW = None
+        app.OAUTH_STATE = None
+
+        with patch(
+            "app.create_authorization_request",
+            return_value=(fake_flow, authorization_url, "state-123"),
+        ) as start_auth:
+            response = self.client.get("/connect-youtube")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], authorization_url)
+        start_auth.assert_called_once()
+
+        with patch("app.complete_authorization") as finish_auth:
+            callback = self.client.get("/?code=auth-code&state=state-123")
+
+        self.assertEqual(callback.status_code, 302)
+        self.assertEqual(callback.headers["Location"], "/")
+        finish_auth.assert_called_once_with(
+            fake_flow,
+            "state-123",
+            "http://localhost/?code=auth-code&state=state-123",
+        )
+        self.assertIsNone(app.OAUTH_FLOW)
+        self.assertIsNone(app.OAUTH_STATE)
+
     def test_home_page_loads_with_playlist_and_individual_options(self):
-        response = self.client.get("/")
+        with patch(
+            "app.get_connection_status",
+            return_value={
+                "configured": True,
+                "connected": False,
+                "message": "Not connected",
+            },
+        ):
+            response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"D&D Session Transcript Scraper", response.data)
         self.assertIn(b"Load playlist videos", response.data)
         self.assertIn(b"Paste individual video links", response.data)
         self.assertIn(b"Chrome", response.data)
+        self.assertIn(b"YouTube account access", response.data)
+        self.assertIn(b'href="/connect-youtube"', response.data)
 
     def test_rejects_more_than_ten_individual_links(self):
         response = self.client.post("/", data={"urls": "\n".join(["abcdefghijk"] * 11)})
@@ -394,7 +405,8 @@ class FlaskRouteTests(unittest.TestCase):
         fetch.assert_not_called()
 
     def test_downloads_only_selected_playlist_videos_in_playlist_order(self):
-        with patch("app.start_batch_worker", return_value=True) as start_worker:
+        with patch("app.get_connection_status", return_value={"connected": True}), \
+             patch("app.start_batch_worker", return_value=True) as start_worker:
             response = self.client.post(
                 "/download-playlist",
                 data={
@@ -503,7 +515,8 @@ class FlaskRouteTests(unittest.TestCase):
         state = self.make_state_for_route()
         app.save_batch_state(state)
 
-        with patch("app.start_batch_worker", return_value=True) as start_worker:
+        with patch("app.get_connection_status", return_value={"connected": True}), \
+             patch("app.start_batch_worker", return_value=True) as start_worker:
             response = self.client.post(
                 "/resume-last",
                 data={"browser": "firefox"},
@@ -511,7 +524,7 @@ class FlaskRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assertTrue(response.headers["Location"].endswith("/batch-progress"))
-        start_worker.assert_called_once_with(browser="firefox")
+        start_worker.assert_called_once_with(browser="")
         self.assertEqual(app.load_batch_state()["videos"][1]["status"], "pending")
 
     def test_download_last_batch_exports_saved_text_without_requests(self):
@@ -525,10 +538,11 @@ class FlaskRouteTests(unittest.TestCase):
         self.assertIn(b"Already saved", response.data)
 
     def test_successful_individual_transcript_download(self):
-        with patch(
-            "app.fetch_single_transcript",
-            return_value="A transcript line.",
-        ) as fetch:
+        with patch("app.get_connection_status", return_value={"connected": True}), \
+             patch(
+                "app.fetch_single_transcript",
+                return_value="A transcript line.",
+            ) as fetch:
             response = self.client.post(
                 "/",
                 data={
