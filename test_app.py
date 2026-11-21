@@ -168,6 +168,54 @@ Second
             "First Second",
         )
 
+    def test_vtt_parser_replaces_expanding_rolling_caption_cues(self):
+        content = """WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+All right. Well,
+
+00:00:01.000 --> 00:00:03.000
+All right. Well, um,
+
+00:00:02.000 --> 00:00:04.000
+All right. Well, um, I'm going to keep an eye on it.
+
+"""
+        self.assertEqual(
+            app.parse_subtitle_file(content, include_timestamps=False),
+            "All right. Well, um, I'm going to keep an eye on it.",
+        )
+
+    def test_vtt_parser_removes_shared_words_between_adjacent_cues(self):
+        content = """WEBVTT
+
+00:00:00.000 --> 00:00:02.000
+We are going to
+
+00:00:01.500 --> 00:00:03.000
+going to the mountains.
+
+"""
+        self.assertEqual(
+            app.parse_subtitle_file(content, include_timestamps=False),
+            "We are going to the mountains.",
+        )
+
+    def test_vtt_parser_preserves_repeated_words_after_a_pause(self):
+        content = """WEBVTT
+
+00:00:00.000 --> 00:00:01.000
+No.
+
+00:00:05.000 --> 00:00:06.000
+No.
+
+"""
+        self.assertEqual(
+            app.parse_subtitle_file(content, include_timestamps=False),
+            "No. No.",
+        )
+
     def test_empty_subtitle_file_is_reported_as_unavailable(self):
         with self.assertRaises(app.NoTranscriptAvailable):
             app.parse_subtitle_file("WEBVTT\n\n")
