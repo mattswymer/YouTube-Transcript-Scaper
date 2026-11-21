@@ -20,7 +20,8 @@ from youtube_api import (
     YouTubeApiError,
     YouTubeApiPermissionDenied,
     YouTubeApiQuotaExceeded,
-    connect_youtube_account,
+    create_authorization_request,
+    complete_authorization,
     download_caption_file,
     get_connection_status,
 )
@@ -36,6 +37,9 @@ SUBTITLE_REQUEST_SLEEP_SECONDS = 2.0
 DATA_DIR = Path(__file__).resolve().parent / "data"
 BATCH_STATE_PATH = DATA_DIR / "last_batch.json"
 BATCH_WORKER_LOCK = threading.Lock()
+OAUTH_LOCK = threading.Lock()
+OAUTH_FLOW = None
+OAUTH_STATE = None
 VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 LANGUAGE_CODE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
 
@@ -1430,21 +1434,61 @@ def start_batch_worker(browser=None):
 
 @app.route("/connect-youtube", methods=["POST"])
 def connect_youtube():
+    global OAUTH_FLOW, OAUTH_STATE
     try:
-        connect_youtube_account()
+        flow, authorization_url, state = create_authorization_request(
+            request.url_root.rstrip("/")
+        )
+        with OAUTH_LOCK:
+            OAUTH_FLOW = flow
+            OAUTH_STATE = state
+        # Navigate this tab to Google; no popup or Python-launched browser is required.
+        return redirect(authorization_url)
     except YouTubeApiError as exc:
         return render_page(str(exc), status=400)
     except Exception as exc:
         return render_page(
-            f"Google authorization failed ({type(exc).__name__}). Check your OAuth Desktop client setup and try again.",
+            f"Google authorization could not start ({type(exc).__name__}). Check your OAuth Desktop client setup and try again.",
             status=400,
         )
-    return render_page()
 
 
 @app.route("/", methods=["GET", "POST"])
 def index():
+    global OAUTH_FLOW, OAUTH_STATE
     if request.method == "GET":
+        if "code" in request.args or "error" in request.args:
+            with OAUTH_LOCK:
+                flow = OAUTH_FLOW
+                expected_state = OAUTH_STATE
+
+            if flow is None:
+                return render_page(
+                    "There is no pending Google authorization. Click Connect YouTube account and try again.",
+                    status=400,
+                )
+
+            try:
+                complete_authorization(flow, expected_state or "", request.url)
+            except YouTubeApiError as exc:
+                with OAUTH_LOCK:
+                    OAUTH_FLOW = None
+                    OAUTH_STATE = None
+                return render_page(str(exc), status=400)
+            except Exception as exc:
+                with OAUTH_LOCK:
+                    OAUTH_FLOW = None
+                    OAUTH_STATE = None
+                return render_page(
+                    f"Google authorization failed ({type(exc).__name__}). Please try connecting again.",
+                    status=400,
+                )
+
+            with OAUTH_LOCK:
+                OAUTH_FLOW = None
+                OAUTH_STATE = None
+            return redirect(url_for("index"))
+
         return render_page()
 
     raw_urls = request.form.get("urls", "")
