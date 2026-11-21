@@ -962,21 +962,83 @@ def parse_subtitle_timestamp(value):
 
 
 def parse_subtitle_file(content, include_timestamps=True):
-    """Convert VTT/SRT caption cues into readable transcript paragraphs."""
+    """Convert VTT/SRT cues into readable paragraphs, removing rolling-caption overlap."""
     cues = []
     current_start = None
+    current_end = None
     current_text = []
 
+    def normalized_words(value):
+        return [
+            re.sub(r"[^\w’']", "", word.casefold())
+            for word in value.split()
+        ]
+
     def flush():
-        nonlocal current_start, current_text
+        nonlocal current_start, current_end, current_text
         text = " ".join(current_text).strip()
         if text and current_start is not None:
             text = html.unescape(re.sub(r"<[^>]*>", "", text))
             text = re.sub(r"\{\\[^}]*\}", "", text)
             text = re.sub(r"\s+", " ", text).strip()
-            if text and (not cues or cues[-1][1] != text):
-                cues.append((current_start, text))
-        current_start = None
+
+            if text:
+                # YouTube can send successive rolling captions containing an
+                # expanded version of words already present in the previous cue.
+                if cues and current_start <= cues[-1][1] + 0.75:
+                    previous_start, previous_end, previous_text = cues[-1]
+                    previous_words = normalized_words(previous_text)
+                    current_words = normalized_words(text)
+
+                    if previous_words and current_words:
+                        if (
+                            len(previous_words) <= len(current_words)
+                            and current_words[:len(previous_words)] == previous_words
+                        ):
+                            cues[-1] = (
+                                previous_start,
+                                max(previous_end, current_end or current_start),
+                                text,
+                            )
+                            current_start = current_end = None
+                            current_text = []
+                            return
+
+                        if (
+                            len(current_words) <= len(previous_words)
+                            and previous_words[:len(current_words)] == current_words
+                        ):
+                            cues[-1] = (
+                                previous_start,
+                                max(previous_end, current_end or current_start),
+                                previous_text,
+                            )
+                            current_start = current_end = None
+                            current_text = []
+                            return
+
+                        max_overlap = min(len(previous_words), len(current_words))
+                        for overlap in range(max_overlap, 0, -1):
+                            overlap_words = previous_words[-overlap:]
+                            if (
+                                overlap_words == current_words[:overlap]
+                                and all(len(word) >= 2 for word in overlap_words)
+                            ):
+                                merged_text = " ".join(
+                                    previous_text.split() + text.split()[overlap:]
+                                )
+                                cues[-1] = (
+                                    previous_start,
+                                    max(previous_end, current_end or current_start),
+                                    merged_text,
+                                )
+                                current_start = current_end = None
+                                current_text = []
+                                return
+
+                cues.append((current_start, current_end or current_start, text))
+
+        current_start = current_end = None
         current_text = []
 
     for raw_line in content.splitlines():
@@ -988,9 +1050,11 @@ def parse_subtitle_file(content, include_timestamps=True):
         if "-->" in line:
             flush()
             try:
-                current_start = parse_subtitle_timestamp(line.split("-->", 1)[0])
-            except (TypeError, ValueError):
-                current_start = None
+                timing = line.split("-->", 1)
+                current_start = parse_subtitle_timestamp(timing[0])
+                current_end = parse_subtitle_timestamp(timing[1].strip().split()[0])
+            except (IndexError, TypeError, ValueError):
+                current_start = current_end = None
             continue
 
         if (
@@ -1012,7 +1076,7 @@ def parse_subtitle_file(content, include_timestamps=True):
     paragraph = []
     last_timestamp = -60.0
 
-    for start, text in cues:
+    for start, _end, text in cues:
         if include_timestamps and start - last_timestamp >= 60:
             if paragraph:
                 output.append(" ".join(paragraph))
@@ -1025,7 +1089,6 @@ def parse_subtitle_file(content, include_timestamps=True):
         output.append(" ".join(paragraph))
 
     return "\n".join(output)
-
 
 def classify_ytdlp_error(exc):
     message = str(exc)
